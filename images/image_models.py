@@ -3,7 +3,7 @@
 """
 import torch
 from torch import nn
-from pytorch_pretrained_vit import ViT
+from transformers import ViTModel
 
 class ImageEncoder(nn.Module):
     def __init__(self, input_dim=768, inter_dim=500, output_dim=300):
@@ -13,9 +13,7 @@ class ImageEncoder(nn.Module):
                 None
         """
         super(ImageEncoder, self).__init__()
-        # model_name = 'B_32'
-        # self.vit = ViT(model_name, pretrained=True)
-        # self.vit.__delattr__("fc")
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
 
         self.input_dim = input_dim
         self.inter_dim = inter_dim
