@@ -7,7 +7,7 @@ from torch import Tensor
 import torch.nn.functional as F
 from torch.nn import Parameter
 from torch_sparse import SparseTensor, set_diag
-from torch_geometric.nn.dense.linear import Linear
+from torch_geometric.nn.models.linear import Linear
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import remove_self_loops, add_self_loops, softmax
 from torch_geometric.nn.inits import  glorot, zeros

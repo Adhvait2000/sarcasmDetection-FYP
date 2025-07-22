@@ -1,8 +1,8 @@
 {
-    "BASE_DIR" : "/home/liuhui/lhgpu/sarcasm",
-    "DATA_DIR" : "/home/liuhui/lhgpu/sarcasm/twitter/img_emb",
-    "TARGET_DIR" : "/home/liuhui/lhgpu/sarcasm/result",
-    "annotation_files" : "/home/liuhui/lhgpu/sarcasm/twitter/dataset_text",
+    "BASE_DIR" : "/Users/adhvaitsrinath/Desktop/sarcasm",
+    "DATA_DIR" : "/Users/adhvaitsrinath/Desktop/sarcasm/twitter/img_emb",
+    "TARGET_DIR" : "/Users/adhvaitsrinath/Desktop/sarcasm/result",
+    "annotation_files" : "/Users/adhvaitsrinath/Desktop/sarcasm/twitter/dataset_text",
     "model_name" : "KEHM",
   
     "patience" : 3,
