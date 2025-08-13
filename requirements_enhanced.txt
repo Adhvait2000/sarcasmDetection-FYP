@@ -1,0 +1,46 @@
+# Enhanced requirements for multi-knowledge sarcasm detection
+# Core dependencies
+torch>=1.9.0
+torchvision>=0.10.0
+transformers>=4.20.0
+numpy>=1.21.0
+scikit-learn>=1.0.0
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+tqdm>=4.62.0
+
+# CLIP for knowledge extraction
+clip @ git+https://github.com/openai/CLIP.git
+
+# Additional dependencies for enhanced models
+huggingface-hub>=0.10.0
+tokenizers>=0.13.0
+Pillow>=8.3.0
+
+# Visualization and reporting
+plotly>=5.0.0
+jupyter>=1.0.0
+ipywidgets>=7.6.0
+
+# Utilities
+pyyaml>=6.0
+tensorboard>=2.8.0
+wandb>=0.13.0
+
+# Optional: For advanced knowledge extraction
+spacy>=3.4.0
+nltk>=3.7
+textblob>=0.17.0
+
+# Optional: For data augmentation
+albumentations>=1.2.0
+imgaug>=0.4.0
+
+# Optional: For hyperparameter optimization
+optuna>=3.0.0
+ray[tune]>=1.13.0
+
+# Optional: For model interpretability
+shap>=0.41.0
+lime>=0.2.0

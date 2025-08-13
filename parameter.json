@@ -49,5 +49,12 @@
     "know_cro_layer": 3,
     "know_cro_head": 5,
     "know_cro_type": 0,
-    "visualization": false
+    "visualization": false,
+
+    
+    "knowledge_types": [1, 2, 3],
+    "max_knowledge_length": 20,
+    "confidence_threshold": 0.7,
+    "frequency_threshold": 2
+
   }
