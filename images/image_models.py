@@ -23,10 +23,8 @@ class ImageEncoder(nn.Module):
         self.fc2 = nn.Linear(self.inter_dim, self.output_dim)
         self.fc3 = nn.Linear(self.output_dim, 1)
         self.relu1 = nn.ReLU()
-        self.softmax = nn.Softmax(dim=1)
+        self.softmax = nn.Softmax(dim=-1)
         self.norm = torch.nn.LayerNorm(self.output_dim)
-
-
 
     def forward(self, x, lam=1):
         """ 
@@ -52,7 +50,7 @@ class ImageEncoder(nn.Module):
         # softmax need to check the output of linear where overflow or underflow
         # (N,K,1)
 
-        pv = self.fc3(x).squeeze()
+        pv = self.fc3(x).squeeze(-1)
         # (N, K)
         pv = self.softmax(pv*lam)
 

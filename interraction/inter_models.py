@@ -80,25 +80,23 @@ class BMCO(nn.Module):
                                dropout=self.dropout)
 
     def forward(self, images, texts, key_padding_mask, key_padding_mask_img=None):
+        dev = images.device
+        kpm_txt = key_padding_mask.to(dev) if key_padding_mask is not None else None
+        kpm_img = key_padding_mask_img.to(dev) if key_padding_mask_img is not None else None
+
         if self.type == 0:
-            # means it is knowledge embedding
-            # if key_padding_mask_img is not None:
-            #     key_padding_mask_img = key_padding_mask_img.cuda()
-            imgs1 = self.cro_img.forward(images, texts, src_key_padding_mask=key_padding_mask.cuda())
-            texts1 = self.cro_txt.forward(texts, images, src_key_padding_mask=key_padding_mask_img.cuda())
+            imgs1  = self.cro_img(images, texts, src_key_padding_mask=kpm_txt)
+            texts1 = self.cro_txt(texts,  images, src_key_padding_mask=kpm_img)
         elif self.type == 1:
-            # image key,value text query
-            # if key_padding_mask_img is not None:
-            #     key_padding_mask_img.cuda()
-            texts1 = self.cro_txt.forward(texts, images, src_key_padding_mask=key_padding_mask_img.cuda())
-            imgs1 = images
+            texts1 = self.cro_txt(texts, images, src_key_padding_mask=kpm_img)
+            imgs1  = images
         elif self.type == 2:
-            # text key,value text
-            imgs1 = self.cro_img.forward(images, texts, src_key_padding_mask=key_padding_mask.cuda())
+            imgs1  = self.cro_img(images, texts, src_key_padding_mask=kpm_txt)
             texts1 = texts
         else:
-            exit()
+            raise ValueError(f"Unknown BMCO type: {self.type}")
         return imgs1, texts1
+
 
 
 class CroModality(nn.Module):
