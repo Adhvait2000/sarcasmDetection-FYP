@@ -11,6 +11,43 @@ from interraction.inter_models import CroModality
 import utils.gat as tg_conv
 import math
 
+
+def pool_tokens_to_words_batch(seq, score, word_spans, pad_len):
+    """
+    Pool token-level seq [B,T,D] to word-level [B,pad_len,D] using word_spans (list of list of [s,e]).
+    Also pools 'score' to [B,pad_len,1] if provided (reduces any channel dim to scalar).
+    """
+    B, T, D = seq.shape
+    device = seq.device
+
+    out_seq = torch.zeros((B, pad_len, D), dtype=seq.dtype, device=device)
+
+    out_score = None
+    if score is not None:
+        score = score.to(device)
+        if score.dim() == 2:         # [B,T]
+            score = score.unsqueeze(-1)          # [B,T,1]
+        elif score.dim() == 3 and score.size(-1) not in (1, D):
+            score = score.mean(dim=-1, keepdim=True)  # [B,T,1]
+        out_score = torch.zeros((B, pad_len, 1), dtype=score.dtype, device=device)
+
+    for b in range(B):
+        spans = word_spans[b] if isinstance(word_spans[b], list) else []
+        Wb = min(len(spans), pad_len)
+        for w in range(Wb):
+            s, e = spans[w]
+            s = max(0, min(int(s), T - 1))
+            e = max(0, min(int(e), T - 1))
+            if e < s:
+                s, e = e, s
+            token_slice = seq[b, s:e+1, :]   # [n,D]
+            out_seq[b, w, :] = token_slice.mean(dim=0)
+            if out_score is not None:
+                token_scores = score[b, s:e+1, :]   # [n,1]
+                out_score[b, w, :] = token_scores.mean(dim=0)
+
+    return out_seq, out_score
+
 class BaselineModel(nn.Module):
     """
     Baseline Model: Image + Text + Captions
@@ -50,7 +87,7 @@ class BaselineModel(nn.Module):
         self.txt_encoder = EnhancedTextEncoder(
             input_size=self.txt_input_dim,
             output_size=self.txt_out_size,
-            knowledge_types=[1],  # Only captions
+            knowledge_types=[],  # Only captions
             dropout=self.cro_drop
         )
         
@@ -123,8 +160,17 @@ class BaselineModel(nn.Module):
             texts=texts,
             key_padding_mask=mask_batch
         )
+
+        # ▶︎ Pool token-level to word-level using spans so shapes match masks/graphs
+        #    texts: [B,T,D] -> [B, max_words, D]
+        texts, text_scores = pool_tokens_to_words_batch(
+            seq=texts,
+            score=text_scores,
+            word_spans=t1_word_seq,
+            pad_len=mask_batch.size(1)
+        )
         
-        # Alignment
+        # Alignment (now t2 length == mask/graph length)
         alignment_scores = self.alignment(
             t2=texts,
             v2=imgs,
@@ -156,7 +202,6 @@ class KnowledgeOnlyModel(nn.Module):
                  txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1):
         super(KnowledgeOnlyModel, self).__init__()
         
-        # Model parameters
         self.txt_input_dim = txt_input_dim
         self.txt_out_size = txt_out_size
         self.knowledge_types = knowledge_types
@@ -169,7 +214,7 @@ class KnowledgeOnlyModel(nn.Module):
         self.txt_gat_head = txt_gat_head
         self.lam = lam
         
-        # Enhanced text encoder for knowledge only
+        # Encode text + knowledge
         self.knowledge_encoder = EnhancedTextEncoder(
             input_size=self.txt_input_dim,
             output_size=self.txt_out_size,
@@ -178,14 +223,14 @@ class KnowledgeOnlyModel(nn.Module):
             dropout=self.cro_drop
         )
         
-        # Knowledge fusion
+        # Fuse different knowledge streams
         self.knowledge_fusion = WeightedKnowledgeAttention(
             input_size=self.txt_out_size,
             num_heads=self.cro_heads,
             dropout=self.cro_drop
         )
         
-        # Knowledge-only alignment
+        # Align fused text (word-level) with knowledge (K nodes)
         self.knowledge_alignment = Alignment(
             input_size=self.txt_out_size,
             txt_gat_layer=self.txt_gat_layer,
@@ -194,28 +239,14 @@ class KnowledgeOnlyModel(nn.Module):
             lam=self.lam
         )
         
-        # Output layer
-        self.output_layer = nn.Linear(self.txt_out_size, 2)
-        
+        # --- NEW: dimension-agnostic head ---
+        # We will reshape [B, 2K] -> [B, 2, K], pool over K -> [B, 2], then classify.
+        self.pool_over_k = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Linear(2, 2)
+
     def forward(self, texts, mask_batch, t1_word_seq, txt_edge_index, gnn_mask, 
                 np_mask, knowledge_inputs, knowledge_masks):
-        """
-        Forward pass for knowledge-only model
-        
-        Args:
-            texts: Text input dictionary
-            mask_batch: Text padding masks
-            t1_word_seq: Word sequences
-            txt_edge_index: Text edge indices
-            gnn_mask: GNN masks
-            np_mask: Noun phrase masks
-            knowledge_inputs: Knowledge inputs (ANPs + attributes)
-            knowledge_masks: Knowledge masks
-            
-        Returns:
-            predictions: Model predictions
-        """
-        # Encode text and knowledge
+        # Encode text & knowledge (token-level)
         texts, text_scores, knowledge_embeddings, knowledge_scores = self.knowledge_encoder(
             text_input=texts,
             knowledge_inputs=knowledge_inputs,
@@ -223,29 +254,51 @@ class KnowledgeOnlyModel(nn.Module):
             lam=self.lam
         )
         
-        # Knowledge fusion
-        fused_text, fused_knowledge, attention_weights = self.knowledge_fusion(
+        # Fuse knowledge streams (still token-level)
+        fused_text, fused_knowledge, _ = self.knowledge_fusion(
             text_embeddings=texts,
             knowledge_embeddings=knowledge_embeddings,
             knowledge_masks=knowledge_masks
         )
-        
-        # Knowledge-only alignment
+
+        # Pool fused_text tokens -> words to match masks/graphs
+        fused_text_word, knowledge_scores = pool_tokens_to_words_batch(
+            seq=fused_text,
+            score=knowledge_scores,
+            word_spans=t1_word_seq,
+            pad_len=mask_batch.size(1)
+        )
+
+        # Alignment returns [B, 2K] (two maps concatenated along last dim)
         alignment_scores = self.knowledge_alignment(
-            t2=fused_text,
+            t2=fused_text_word,
             v2=fused_knowledge,
             edge_index=txt_edge_index,
             gnn_mask=gnn_mask,
-            score=text_scores,
+            score=knowledge_scores,
             key_padding_mask=mask_batch,
             np_mask=np_mask,
             lam=self.lam
-        )
-        
-        # Final prediction
-        predictions = self.output_layer(alignment_scores)
-        
+        )  # shape: [B, 2K]
+
+        B, twoK = alignment_scores.shape
+        if twoK == 0:
+            # Edge-case guard (no knowledge nodes): fall back to zeros
+            logits = self.classifier(torch.zeros(B, 2, device=alignment_scores.device, dtype=alignment_scores.dtype))
+            return logits
+
+        K = twoK // 2
+        a1 = alignment_scores[:, :K]   # [B, K]
+        a2 = alignment_scores[:, K:]   # [B, K]
+
+        # Stack into [B, 2, K] then pool over K -> [B, 2]
+        stacked = torch.stack([a1, a2], dim=1)              # [B, 2, K]
+        pooled = self.pool_over_k(stacked).squeeze(-1)      # [B, 2]
+
+        # Final logits
+        predictions = self.classifier(pooled)               # [B, 2]
         return predictions
+
 
 class HybridModel(nn.Module):
     """
@@ -379,34 +432,50 @@ class HybridModel(nn.Module):
             texts=texts,
             key_padding_mask=mask_batch
         )
-        
-        # Knowledge fusion
+
+        # ▶︎ Pool tokens -> words for the text branch used in text-image alignment
+        texts_word, text_scores_word = pool_tokens_to_words_batch(
+            seq=texts,
+            score=text_scores,
+            word_spans=t1_word_seq,
+            pad_len=mask_batch.size(1)
+        )
+
+        # Knowledge fusion (still token-level inputs)
         fused_text, fused_knowledge, attention_weights = self.knowledge_fusion(
             text_embeddings=texts,
             knowledge_embeddings=knowledge_embeddings,
             knowledge_masks=knowledge_masks
         )
-        
+
+        # ▶︎ Pool fused_text to words for knowledge alignment
+        fused_text_word, knowledge_scores_word = pool_tokens_to_words_batch(
+            seq=fused_text,
+            score=knowledge_scores,
+            word_spans=t1_word_seq,
+            pad_len=mask_batch.size(1)
+        )
+
         # Text-image alignment
         text_image_alignment = self.text_image_alignment(
-            t2=texts,
+            t2=texts_word,
             v2=imgs,
             edge_index=txt_edge_index,
             gnn_mask=gnn_mask,
-            score=text_scores,
+            score=text_scores_word,
             key_padding_mask=mask_batch,
             np_mask=np_mask,
             img_edge_index=img_edge_index,
             lam=self.lam
         )
-        
+
         # Knowledge alignment
         knowledge_alignment = self.knowledge_alignment(
-            t2=fused_text,
+            t2=fused_text_word,
             v2=fused_knowledge,
             edge_index=txt_edge_index,
             gnn_mask=gnn_mask,
-            score=knowledge_scores,
+            score=knowledge_scores_word,
             key_padding_mask=mask_batch,
             np_mask=np_mask,
             lam=self.lam
@@ -446,7 +515,6 @@ class Alignment(nn.Module):
         self.img_self_loops = img_self_loops
         self.lam = lam
         
-        # GAT layers
         self.txt_conv = nn.ModuleList([
             tg_conv.GATConv(
                 in_channels=self.input_size,
@@ -457,7 +525,7 @@ class Alignment(nn.Module):
                 fill_value="mean",
                 add_self_loops=self.txt_self_loops,
                 is_text=True
-            ) for i in range(self.txt_gat_layer)
+            ) for _ in range(self.txt_gat_layer)
         ])
         
         self.img_conv = nn.ModuleList([
@@ -469,10 +537,9 @@ class Alignment(nn.Module):
                 dropout=self.img_gat_drop,
                 fill_value="mean",
                 add_self_loops=self.img_self_loops
-            ) for i in range(self.img_gat_layer)
+            ) for _ in range(self.img_gat_layer)
         ])
         
-        # Importance scoring
         self.linear1 = nn.Linear(self.input_size, 1)
         self.linear2 = nn.Linear(self.input_size, 1)
         self.norm = nn.LayerNorm(self.input_size)
@@ -481,42 +548,81 @@ class Alignment(nn.Module):
     def forward(self, t2, v2, edge_index, gnn_mask, score, key_padding_mask, 
                 np_mask, img_edge_index, lam=1):
         """
-        Forward pass for alignment computation
+        t2: [B, L, D] (WORD-level embeddings)
+        v2: [B, K, D]
+        score: per-token weights; accepts [B,L], [B,L,1], or [B,L,D]
         """
-        # Atomic level congruity
-        q1 = torch.bmm(t2, v2.permute(0, 2, 1)) / math.sqrt(t2.size(2))
-        c = torch.sum(score * t2, dim=1, keepdim=True)
-        
-        # Token importance
-        pa_token = self.linear1(t2).squeeze().masked_fill_(key_padding_mask, float("-Inf"))
-        
-        # GAT processing
+        dev = t2.device
+        B, L, D = t2.shape
+
+        # --- score -> [B,L,1] or [B,L,D] (broadcastable) ---
+        if score is None:
+            score = torch.full((B, L, 1), 1.0 / max(L, 1), device=dev, dtype=t2.dtype)
+        else:
+            score = score.to(dev)
+            if score.dim() == 2:
+                score = score.unsqueeze(-1)              # [B,L,1]
+            elif score.dim() == 3 and score.size(-1) not in (1, D):
+                score = score.mean(dim=-1, keepdim=True) # [B,L,1]
+
+        # --- masks to device & safe shapes ---
+        key_padding_mask = (key_padding_mask.to(dev).bool()
+                            if key_padding_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=dev))
+        if key_padding_mask.size(1) != L:
+            # pad or crop to match L
+            kpm = torch.zeros(B, L, dtype=torch.bool, device=dev)
+            m = min(L, key_padding_mask.size(1))
+            kpm[:, :m] = key_padding_mask[:, :m]
+            key_padding_mask = kpm
+
+        # atomic congruity
+        q1 = torch.bmm(t2, v2.permute(0, 2, 1)) / math.sqrt(float(D))
+        c = torch.sum(score * t2, dim=1, keepdim=True)  # [B,1,D]
+
+        # token importance
+        pa_token = self.linear1(t2).squeeze(-1)  # [B,L]
+        pa_token = pa_token.masked_fill(key_padding_mask, float("-inf"))
+        pa_token = F.softmax(pa_token * lam, dim=1).unsqueeze(2).expand(B, L, v2.size(1))  # [B,L,K]
+
+        # text GAT
         tnp = t2
         for gat in self.txt_conv:
             tnp = self.norm(torch.stack([
-                (self.relu1(gat(data[0], data[1].cuda(), mask=data[2])))
-                for data in zip(tnp, edge_index, gnn_mask)
-            ]))
-        
+                self.relu1(gat(x, ei.to(dev), mask=m.to(dev)))
+                for x, ei, m in zip(tnp, edge_index, gnn_mask)
+            ], dim=0))  # [B,L,D]
+
+        # image GAT
         v3 = v2
+        # Ensure we pass a 2D edge_index per sample
+        if isinstance(img_edge_index, (list, tuple)):
+            iei_seq = [ei.to(dev) for ei in img_edge_index]
+        elif isinstance(img_edge_index, torch.Tensor) and img_edge_index.dim() == 3:
+            # Batched edge_index of shape [B, 2, E] -> list of [2, E]
+            iei_seq = [img_edge_index[b].to(dev) for b in range(img_edge_index.size(0))]
+        else:
+            # Single graph: broadcast to all samples in the batch
+            iei_seq = [img_edge_index.to(dev) for _ in range(v3.size(0))]
+
         for gat in self.img_conv:
             v3 = self.norm(torch.stack([
-                self.relu1(gat(data, img_edge_index.cuda()))
-                for data in v3
-            ]))
-        
-        # Compositional level congruity
-        tnp = torch.cat([tnp, c], dim=1)
-        q2 = torch.bmm(tnp, v3.permute(0, 2, 1)) / math.sqrt(tnp.size(2))
-        
+                self.relu1(gat(x, ei)) for x, ei in zip(v3, iei_seq)
+            ], dim=0))  # [B,K,D]
+
+        # compositional congruity
+        tnp = torch.cat([tnp, c], dim=1)  # [B,L+1,D]
+        q2 = torch.bmm(tnp, v3.permute(0, 2, 1)) / math.sqrt(float(tnp.size(2)))  # [B,L+1,K]
+
         # NP importance
-        pa_np = self.linear2(tnp).squeeze().masked_fill_(np_mask, float("-Inf"))
-        pa_np = F.softmax(pa_np * lam, dim=1).unsqueeze(2).repeat((1, 1, v3.size(1)))
-        pa_token = F.softmax(pa_token * lam, dim=1).unsqueeze(2).repeat((1, 1, v3.size(1)))
-        
-        # Final alignment
-        a_1 = torch.sum(q1 * pa_token, dim=1)
-        a_2 = torch.sum(q2 * pa_np, dim=1)
-        a = torch.cat([a_1, a_2], dim=1)
-        
-        return a
+        pa_np = self.linear2(tnp).squeeze(-1)  # [B,L+1]
+        if (np_mask is None) or (np_mask.size(1) != tnp.size(1)):
+            np_mask = torch.zeros_like(pa_np, dtype=torch.bool, device=dev)
+        else:
+            np_mask = np_mask.to(dev).bool()
+        pa_np = pa_np.masked_fill(np_mask, float("-inf"))
+        pa_np = F.softmax(pa_np * lam, dim=1).unsqueeze(2).expand(B, tnp.size(1), v3.size(1))  # [B,L+1,K]
+
+        a_1 = torch.sum(q1 * pa_token, dim=1)  # [B,K]
+        a_2 = torch.sum(q2 * pa_np,   dim=1)   # [B,K]
+        return torch.cat([a_1, a_2], dim=1)    # [B,2K]
+

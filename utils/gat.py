@@ -7,7 +7,7 @@ from torch import Tensor
 import torch.nn.functional as F
 from torch.nn import Parameter
 from torch_sparse import SparseTensor, set_diag
-from torch_geometric.nn.models.linear import Linear
+from torch_geometric.nn import Linear
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import remove_self_loops, add_self_loops, softmax
 from torch_geometric.nn.inits import  glorot, zeros
@@ -155,6 +155,7 @@ class GATConv(MessagePassing):
         glorot(self.att_dst)
         glorot(self.att_edge)
         zeros(self.bias)
+    
 
     def forward(self, x: Union[Tensor, OptPairTensor], edge_index: Adj,
                 edge_attr: OptTensor = None, size: Size = None,
@@ -170,8 +171,17 @@ class GATConv(MessagePassing):
                 :obj:`(edge_index, attention_weights)`, holding the computed
                 attention weights for each edge. (default: :obj:`None`)
         """
-        if self.is_text:
-            if mask:
+        # if self.is_text:
+        #     if mask:
+        #         return x
+        if self.is_text and mask is not None:
+            if isinstance(mask, torch.Tensor):
+                # If mask is empty or (optionally) all True (fully masked), skip GAT
+                if mask.numel() == 0:
+                    return x
+                if mask.dtype == torch.bool and mask.flatten().all().item():
+                    return x
+            elif isinstance(mask, (bool, int)) and bool(mask):
                 return x
         H, C = self.heads, self.out_channels
 

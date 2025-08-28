@@ -113,14 +113,29 @@ class ModelEvaluator:
         model_config = self.model_configs[model_type]
         knowledge_types = model_config['knowledge_types']
         
-        # Create dataset
+        # Create dataset with dataset sampling
+        dataset_percentage = self.parameter.get("dataset_percentage", 100.0) / 100.0  # Convert percentage to decimal
+        
+        # Get file names from parameters or use defaults
+        train_img_file = self.parameter.get("train_img_file", "train_B32.pt")
+        val_img_file = self.parameter.get("val_img_file", "val_B32.pt")
+        test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
+        
+        # Map split to correct file
+        split_to_file = {
+            "train": train_img_file,
+            "val": val_img_file,
+            "test": test_img_file
+        }
+        
         dataset = EnhancedBaseSet(
             type=split,
             max_length=self.parameter["max_length"],
             text_path=self.parameter["annotation_files"] + f"/{split}.json",
-            img_path=self.parameter["DATA_DIR"] + f"/{split}.pt",
+            img_path=self.parameter["DATA_DIR"] + "/" + split_to_file[split],
             knowledge_types=knowledge_types,
-            max_knowledge_length=self.parameter.get("know_max_length", 20)
+            max_knowledge_length=self.parameter.get("know_max_length", 20),
+            dataset_percentage=dataset_percentage
         )
         
         # Create collate function

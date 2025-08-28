@@ -1,45 +1,30 @@
 """
-    Tensorflow logger for monitoring train/val curves
+Simple Logger for Training (No TensorBoard Dependencies)
 """
-from torch.utils.tensorboard import SummaryWriter
-import torch
+import os
+import json
+from datetime import datetime
 
-
-class Logger:
-
-    def __init__(self, model_name, data_name, log_path):
-        """
-            Initializes the logger object for computing loss/accuracy curves
-            Args:
-                model_name (str): The name of the model for which training needs to be monitored
-                data_name (str): Dataset name
-                log_path (str): Base path for logging
-        """
-        self.model_name = model_name
-        self.data_name = data_name
-
-        self.comment = '{}_{}'.format(model_name, data_name)
-
-        # TensorBoard
-        self.train_writer = SummaryWriter(log_dir=log_path+'/train/', comment=self.comment)
-        self.val_writer = SummaryWriter(log_dir=log_path+'/val/', comment=self.comment)
-
-    def log(self, mode, scalar_value, epoch, scalar_name='error'):
-        """
-            Logs the scalar value passed for train and val epoch
-            Args:
-                mode (str): train/val
-                scalar_value (float): loss/accuracy value to be logged
-                epoch (int): epoch number
-                scalar_name (str): name of scalar to be logged
-            Returns:
-                None
-        """
-
-        if isinstance(scalar_value, torch.autograd.Variable):
-            scalar_value = scalar_value.data.cpu().numpy()
-
-        if mode == 'train':
-            self.train_writer.add_scalar(self.comment + '_' + scalar_name, scalar_value, epoch)
-        if mode == 'val':
-            self.val_writer.add_scalar(self.comment + '_' + scalar_name, scalar_value, epoch)
+class SimpleLogger:
+    def __init__(self, log_dir="logs"):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = os.path.join(log_dir, f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        self.metrics = {}
+        
+    def log_scalar(self, tag, value, step):
+        """Log a scalar value"""
+        if tag not in self.metrics:
+            self.metrics[tag] = []
+        self.metrics[tag].append({"step": step, "value": value})
+        
+        # Write to log file
+        with open(self.log_file, 'a') as f:
+            f.write(f"{datetime.now().isoformat()} - {tag}: {value} (step {step})\n")
+    
+    def close(self):
+        """Save all metrics to JSON file"""
+        metrics_file = self.log_file.replace('.log', '_metrics.json')
+        with open(metrics_file, 'w') as f:
+            json.dump(self.metrics, f, indent=2)
+        print(f"Metrics saved to: {metrics_file}")

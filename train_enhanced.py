@@ -5,7 +5,7 @@ Supports all three model variants with comprehensive evaluation
 import argparse
 from tqdm import tqdm
 import os
-from utils.logging.tf_logger import Logger
+from utils.logging.tf_logger import SimpleLogger as Logger
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.optim as optim
@@ -63,8 +63,7 @@ class EnhancedTrainer:
             self.optimizer,
             mode='min',
             factor=0.1,
-            patience=self.parameter["patience"],
-            verbose=True
+            patience=self.parameter["patience"]
         )
         
         self.criterion = CrossEntropyLoss()
@@ -136,44 +135,53 @@ class EnhancedTrainer:
     def _get_knowledge_types(self):
         """Get knowledge types based on model type"""
         if self.model_type == "baseline":
-            return [1]  # Only captions
+            return [0]  # Only captions
         elif self.model_type == "knowledge_only":
             return [2, 3]  # ANP and attributes
         elif self.model_type == "hybrid":
             return [1, 2, 3]  # All knowledge types
-        else:
-            return [0]  # No knowledge
+        
     
     def _create_data_loaders(self):
         """Create data loaders for the specific model type"""
         knowledge_types = self._get_knowledge_types()
         
-        # Create datasets
+        # Create datasets with dataset sampling
+        dataset_percentage = self.parameter.get("dataset_percentage", 100.0) / 100.0  # Convert percentage to decimal
+        
+        # Get file names from parameters or use defaults
+        train_img_file = self.parameter.get("train_img_file", "train_B32.pt")
+        val_img_file = self.parameter.get("val_img_file", "val_B32.pt")
+        test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
+        
         train_dataset = EnhancedBaseSet(
             type="train",
             max_length=self.parameter["max_length"],
             text_path=self.parameter["annotation_files"] + "/train.json",
-            img_path=self.parameter["DATA_DIR"] + "/train.pt",
+            img_path=self.parameter["DATA_DIR"] + "/" + train_img_file,
             knowledge_types=knowledge_types,
-            max_knowledge_length=self.parameter.get("know_max_length", 20)
+            max_knowledge_length=self.parameter.get("know_max_length", 20),
+            dataset_percentage=dataset_percentage
         )
         
         val_dataset = EnhancedBaseSet(
             type="val",
             max_length=self.parameter["max_length"],
             text_path=self.parameter["annotation_files"] + "/val.json",
-            img_path=self.parameter["DATA_DIR"] + "/val.pt",
+            img_path=self.parameter["DATA_DIR"] + "/" + val_img_file,
             knowledge_types=knowledge_types,
-            max_knowledge_length=self.parameter.get("know_max_length", 20)
+            max_knowledge_length=self.parameter.get("know_max_length", 20),
+            dataset_percentage=dataset_percentage
         )
         
         test_dataset = EnhancedBaseSet(
             type="test",
             max_length=self.parameter["max_length"],
             text_path=self.parameter["annotation_files"] + "/test.json",
-            img_path=self.parameter["DATA_DIR"] + "/test.pt",
+            img_path=self.parameter["DATA_DIR"] + "/" + test_img_file,
             knowledge_types=knowledge_types,
-            max_knowledge_length=self.parameter.get("know_max_length", 20)
+            max_knowledge_length=self.parameter.get("know_max_length", 20),
+            dataset_percentage=dataset_percentage
         )
         
         # Create collate function
@@ -188,7 +196,7 @@ class EnhancedTrainer:
             batch_size=self.parameter["batch_size"],
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=4
+            num_workers=0
         )
         
         val_loader = DataLoader(
@@ -196,7 +204,7 @@ class EnhancedTrainer:
             batch_size=self.parameter["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=4
+            num_workers=0
         )
         
         test_loader = DataLoader(
@@ -204,7 +212,7 @@ class EnhancedTrainer:
             batch_size=self.parameter["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=4
+            num_workers=0
         )
         
         return train_loader, val_loader, test_loader
@@ -350,7 +358,7 @@ class EnhancedTrainer:
             'precision': precision,
             'recall': recall,
             'f1': f1,
-            'confusion_matrix': cm
+            'confusion_matrix': cm.tolist()
         }
     
     def _prepare_batch(self, batch):
@@ -516,11 +524,22 @@ def main():
                        help='Path to parameter file')
     parser.add_argument('--epochs', type=int, default=10,
                        help='Number of training epochs')
+    parser.add_argument('--dataset_percentage', type=float, default=None,
+                       help='Override dataset percentage (1-100) for this training run')
     
     args = parser.parse_args()
     
     # Train model
     trainer = EnhancedTrainer(args.model_type, args.parameter_file)
+    
+    # Override dataset percentage if specified
+    if args.dataset_percentage is not None:
+        if args.dataset_percentage < 1 or args.dataset_percentage > 100:
+            print("Error: Dataset percentage must be between 1 and 100")
+            return
+        trainer.parameter['dataset_percentage'] = args.dataset_percentage
+        print(f"🎯 Overriding dataset percentage to {args.dataset_percentage}% for this training run")
+    
     results = trainer.train(args.epochs)
     
     print(f"\nTraining completed for {args.model_type} model!")

@@ -1,0 +1,76 @@
+{
+    "BASE_DIR": "/Users/adhvaitsrinath/Desktop/sarcasm",
+    "DATA_DIR": "/Users/adhvaitsrinath/Desktop/sarcasm/twitter/img_emb",
+    "TARGET_DIR": "/Users/adhvaitsrinath/Desktop/sarcasm/result",
+    "annotation_files": "/Users/adhvaitsrinath/Desktop/sarcasm/twitter/dataset_text",
+    "model_name": "Enhanced_KEHM",
+    
+    "patience": 3,
+    "batch_size": 4,
+    "epochs": 10,
+    "max_length": 120,
+    "use_np": false,
+    "seed": 42,
+    "weight_decay": 0.005,
+    "lr": 2e-5,
+    
+    "txt_input_dim": 768,
+    "txt_out_size": 200,
+    "img_input_dim": 768,
+    "img_inter_dim": 500,
+    "img_out_dim": 200,
+    
+    "cro_layers": 6,
+    "cro_heads": 5,
+    "cro_drop": 0.5,
+    
+    "txt_gat_layer": 2,
+    "txt_gat_drop": 0.5,
+    "txt_gat_head": 2,
+    "txt_self_loops": true,
+    "img_gat_layer": 2,
+    "img_gat_drop": 0.5,
+    "img_gat_head": 2,
+    "img_self_loops": true,
+    "img_edge_dim": 0,
+    "img_patch": 49,
+    
+    "lambda": 1,
+    "type_bmco": 1,
+    
+    "knowledge_type": 4,
+    "know_max_length": 20,
+    "know_gat_layer": 2,
+    "know_gat_head": 1,
+    "know_cro_layer": 3,
+    "know_cro_head": 5,
+    "know_cro_type": 0,
+    "visualization": false,
+    
+    "dataset_percentage": 50.0,
+    
+    "train_img_file": "train_B32.pt",
+    "val_img_file": "val_B32.pt", 
+    "test_img_file": "test_B32.pt",
+    
+    "enhanced_model_config": {
+        "knowledge_types": [1, 2, 3],
+        "max_knowledge_length": 20,
+        "confidence_threshold": 0.7,
+        "frequency_threshold": 2,
+        "clip_model_name": "openai/clip-vit-base-patch32",
+        "use_enhanced_models": true,
+        "knowledge_fusion_type": "attention",
+        "knowledge_attention_heads": 8,
+        "knowledge_dropout": 0.1,
+        "use_mixed_precision": false,
+        "gradient_accumulation_steps": 4,
+        "max_grad_norm": 1.0,
+        "clip_batch_size": 8,
+        "knowledge_cache_size": 1000
+    }
+}
+
+
+
+
