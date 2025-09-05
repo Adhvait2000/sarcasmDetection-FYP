@@ -70,6 +70,10 @@ class EnhancedTrainer:
         
         # Initialize logger
         self.logger = Logger(f"logs/{model_type}_training")
+
+        # Early Stopping parameters
+        self.early_stopping_patience = self.parameter.get("early_stopping_patience", 3)
+        self.early_stop_min_delta = self.parameter.get("early_stop_min_delta", 0.001)
         
     def _initialize_model(self):
         """Initialize model based on type"""
@@ -433,7 +437,9 @@ class EnhancedTrainer:
             'parameter': self.parameter
         }
         
-        torch.save(checkpoint, f"{save_dir}/{self.model_type}_epoch_{epoch}.pt")
+        path = f"{save_dir}/{self.model_type}_epoch_{epoch}.pt"
+        torch.save(checkpoint, path)
+        return path
     
     def plot_confusion_matrix(self, cm, save_path):
         """Plot and save confusion matrix"""
@@ -455,6 +461,8 @@ class EnhancedTrainer:
         
         best_val_f1 = 0
         best_epoch = 0
+        best_ckpt_path = None
+        no_improve = 0  # Counter for early stopping
         
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -484,13 +492,25 @@ class EnhancedTrainer:
             if val_metrics['f1'] > best_val_f1:
                 best_val_f1 = val_metrics['f1']
                 best_epoch = epoch
-                self.save_model(epoch, val_metrics)
+                best_ckpt_path = self.save_model(epoch, val_metrics)
                 
                 # Plot confusion matrix
                 self.plot_confusion_matrix(
                     val_metrics['confusion_matrix'],
                     f"confusion_matrix_{self.model_type}_epoch_{epoch}.png"
                 )
+                no_improve = 0  # Reset counter
+            else:
+                no_improve += 1
+
+            if no_improve >= self.early_stopping_patience:
+                print(f"Early stopping triggered after {epoch+1} (no val F1 improvement for {no_improve} epochs).")
+                break
+        # reload before testing
+        if best_ckpt_path is not None:
+            ckpt = torch.load(best_ckpt_path, map_location=device)
+            self.model.load_state_dict(ckpt['model_state_dict'])
+            print(f"\nLoaded best checkpoint from epoch {best_epoch} for final test.") 
         
         # Test on best model
         print(f"\nTesting best model (epoch {best_epoch})...")
