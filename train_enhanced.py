@@ -73,7 +73,7 @@ class EnhancedTrainer:
 
         # Early Stopping parameters
         self.early_stopping_patience = self.parameter.get("early_stopping_patience", 3)
-        self.early_stop_min_delta = self.parameter.get("early_stop_min_delta", 0.001)
+        self.early_stop_min_delta   = self.parameter.get("early_stop_min_delta", 0.001)
         
     def _initialize_model(self):
         """Initialize model based on type"""
@@ -144,82 +144,88 @@ class EnhancedTrainer:
             return [2, 3]  # ANP and attributes
         elif self.model_type == "hybrid":
             return [1, 2, 3]  # All knowledge types
-        
-    
+
     def _create_data_loaders(self):
         """Create data loaders for the specific model type"""
         knowledge_types = self._get_knowledge_types()
-        
-        # Create datasets with dataset sampling
-        dataset_percentage = self.parameter.get("dataset_percentage", 100.0) / 100.0  # Convert percentage to decimal
-        
-        # Get file names from parameters or use defaults
+
+        # Normalize dataset_percentage (accept 50 or 0.5)
+        raw_pct = self.parameter.get("dataset_percentage", 100.0)
+        dataset_percentage = raw_pct if raw_pct <= 1.0 else raw_pct / 100.0
+        print(f"Dataset sampling: configured {dataset_percentage*100:.1f}% (raw={raw_pct})")
+
+        # File names 
         train_img_file = self.parameter.get("train_img_file", "train_B32.pt")
-        val_img_file = self.parameter.get("val_img_file", "val_B32.pt")
-        test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
-        
+        val_img_file   = self.parameter.get("val_img_file",   "val_B32.pt")
+        test_img_file  = self.parameter.get("test_img_file",  "test_B32.pt")
+
+        # Datasets
         train_dataset = EnhancedBaseSet(
             type="train",
             max_length=self.parameter["max_length"],
-            text_path=self.parameter["annotation_files"] + "/train.json",
-            img_path=self.parameter["DATA_DIR"] + "/" + train_img_file,
+            text_path=os.path.join(self.parameter["annotation_files"], "train.json"),
+            img_path=os.path.join(self.parameter["DATA_DIR"], train_img_file),
             knowledge_types=knowledge_types,
             max_knowledge_length=self.parameter.get("know_max_length", 20),
-            dataset_percentage=dataset_percentage
+            dataset_percentage=dataset_percentage,
         )
-        
+
         val_dataset = EnhancedBaseSet(
             type="val",
             max_length=self.parameter["max_length"],
-            text_path=self.parameter["annotation_files"] + "/val.json",
-            img_path=self.parameter["DATA_DIR"] + "/" + val_img_file,
+            text_path=os.path.join(self.parameter["annotation_files"], "val.json"),
+            img_path=os.path.join(self.parameter["DATA_DIR"], val_img_file),
             knowledge_types=knowledge_types,
             max_knowledge_length=self.parameter.get("know_max_length", 20),
-            dataset_percentage=dataset_percentage
+            dataset_percentage=dataset_percentage,
         )
-        
+
         test_dataset = EnhancedBaseSet(
             type="test",
             max_length=self.parameter["max_length"],
-            text_path=self.parameter["annotation_files"] + "/test.json",
-            img_path=self.parameter["DATA_DIR"] + "/" + test_img_file,
+            text_path=os.path.join(self.parameter["annotation_files"], "test.json"),
+            img_path=os.path.join(self.parameter["DATA_DIR"], test_img_file),
             knowledge_types=knowledge_types,
             max_knowledge_length=self.parameter.get("know_max_length", 20),
-            dataset_percentage=dataset_percentage
+            dataset_percentage=dataset_percentage,
         )
-        
-        # Create collate function
+
+
+        # Collate
         collate_fn = MultiKnowledgePadCollate(
             knowledge_types=knowledge_types,
-            max_knowledge_length=self.parameter.get("know_max_length", 20)
+            max_knowledge_length=self.parameter.get("know_max_length", 20),
         )
-        
-        # Create data loaders
+
+        # num_workers configurable; 0 is the safest on macOS
+        nw = self.parameter.get("num_workers", 0)
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.parameter["batch_size"],
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=0
+            num_workers=nw,
         )
-        
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.parameter["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=0
+            num_workers=nw,
         )
-        
+
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.parameter["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=0
+            num_workers=nw,
         )
-        
+
         return train_loader, val_loader, test_loader
+
     
     def train_epoch(self, train_loader):
         """Train for one epoch"""
@@ -267,8 +273,8 @@ class EnhancedTrainer:
                     knowledge_masks=knowledge_masks
                 )
             
-            # Get labels
-            labels = batch[-1] if self.model_type == "knowledge_only" else batch[8]
+            # Get labels (labels are always at index 8)
+            labels = batch[8]
             labels = labels.to(device)
             
             # Compute loss
@@ -335,8 +341,9 @@ class EnhancedTrainer:
                     )
                 
                 # Get labels
-                labels = batch[-1] if self.model_type == "knowledge_only" else batch[8]
-                labels = labels.to(device)
+                # labels = batch[-1] if self.model_type == "knowledge_only" else batch[8]
+                # labels = labels.to(device)
+                labels = batch[8].to(device)
                 
                 # Compute loss
                 loss = self.criterion(outputs, labels)
@@ -362,7 +369,7 @@ class EnhancedTrainer:
             'precision': precision,
             'recall': recall,
             'f1': f1,
-            'confusion_matrix': cm.tolist()
+            'confusion_matrix': cm
         }
     
     def _prepare_batch(self, batch):
@@ -424,9 +431,7 @@ class EnhancedTrainer:
                knowledge_inputs, knowledge_masks
     
     def save_model(self, epoch, metrics, save_dir="saved_models"):
-        """Save model checkpoint"""
         os.makedirs(save_dir, exist_ok=True)
-        
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -436,10 +441,10 @@ class EnhancedTrainer:
             'model_type': self.model_type,
             'parameter': self.parameter
         }
-        
         path = f"{save_dir}/{self.model_type}_epoch_{epoch}.pt"
         torch.save(checkpoint, path)
         return path
+
     
     def plot_confusion_matrix(self, cm, save_path):
         """Plot and save confusion matrix"""
@@ -461,8 +466,8 @@ class EnhancedTrainer:
         
         best_val_f1 = 0
         best_epoch = 0
-        best_ckpt_path = None
-        no_improve = 0  # Counter for early stopping
+        best_ckpt = None
+        epochs_no_improve = 0
         
         for epoch in range(num_epochs):
             print(f"\nEpoch {epoch+1}/{num_epochs}")
@@ -488,29 +493,34 @@ class EnhancedTrainer:
             print(f"Val Precision: {val_metrics['precision']:.4f}, Val Recall: {val_metrics['recall']:.4f}")
             print(f"Val F1: {val_metrics['f1']:.4f}")
             
-            # Save best model
-            if val_metrics['f1'] > best_val_f1:
+
+            # ---- Early stopping check (on F1 with min_delta) ----
+            improved = (val_metrics['f1'] - best_val_f1) > getattr(self, "early_stop_min_delta", 0.0)
+            if improved:
                 best_val_f1 = val_metrics['f1']
                 best_epoch = epoch
-                best_ckpt_path = self.save_model(epoch, val_metrics)
-                
-                # Plot confusion matrix
+                epochs_no_improve = 0
+
+                # Save best checkpoint & confusion matrix
+                if hasattr(self, "save_model"):
+                    best_ckpt_path = self.save_model(epoch, val_metrics)
                 self.plot_confusion_matrix(
                     val_metrics['confusion_matrix'],
                     f"confusion_matrix_{self.model_type}_epoch_{epoch}.png"
                 )
-                no_improve = 0  # Reset counter
             else:
-                no_improve += 1
+                epochs_no_improve += 1
+                if epochs_no_improve >= getattr(self, "early_stopping_patience", 3):
+                    print(f"Early stopping triggered at epoch {epoch+1} "
+                        f"(no val F1 improvement > {getattr(self, 'early_stop_min_delta', 0.0)} "
+                        f"for {epochs_no_improve} epochs).")
+                    break
 
-            if no_improve >= self.early_stopping_patience:
-                print(f"Early stopping triggered after {epoch+1} (no val F1 improvement for {no_improve} epochs).")
-                break
-        # reload before testing
+        # ---- Reload best checkpoint before testing ----
         if best_ckpt_path is not None:
             ckpt = torch.load(best_ckpt_path, map_location=device)
             self.model.load_state_dict(ckpt['model_state_dict'])
-            print(f"\nLoaded best checkpoint from epoch {best_epoch} for final test.") 
+            print(f"\nLoaded best checkpoint from epoch {best_epoch} for final test.")
         
         # Test on best model
         print(f"\nTesting best model (epoch {best_epoch})...")
@@ -544,22 +554,11 @@ def main():
                        help='Path to parameter file')
     parser.add_argument('--epochs', type=int, default=10,
                        help='Number of training epochs')
-    parser.add_argument('--dataset_percentage', type=float, default=None,
-                       help='Override dataset percentage (1-100) for this training run')
     
     args = parser.parse_args()
     
     # Train model
     trainer = EnhancedTrainer(args.model_type, args.parameter_file)
-    
-    # Override dataset percentage if specified
-    if args.dataset_percentage is not None:
-        if args.dataset_percentage < 1 or args.dataset_percentage > 100:
-            print("Error: Dataset percentage must be between 1 and 100")
-            return
-        trainer.parameter['dataset_percentage'] = args.dataset_percentage
-        print(f"🎯 Overriding dataset percentage to {args.dataset_percentage}% for this training run")
-    
     results = trainer.train(args.epochs)
     
     print(f"\nTraining completed for {args.model_type} model!")

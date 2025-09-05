@@ -54,6 +54,10 @@ class KnowledgeExtractor:
         if torch.is_tensor(image):
             # Convert tensor to PIL (assuming normalized tensor)
             image = self._tensor_to_pil(image)
+            if image is None:
+                # If we can't convert tensor to PIL, return empty list
+                # This happens when we have pre-computed embeddings instead of raw images
+                return []
         
         # Prepare image for CLIP
         inputs = self.clip_processor(images=image, return_tensors="pt")
@@ -95,6 +99,13 @@ class KnowledgeExtractor:
         Returns:
             List of (attribute, confidence) tuples
         """
+        # If we have pre-computed embeddings instead of raw images, return empty list
+        if torch.is_tensor(image):
+            pil_image = self._tensor_to_pil(image)
+            if pil_image is None:
+                return []
+            image = pil_image
+        
         # Combine emotional and stylistic attributes
         all_attributes = self.emotional_attributes + self.stylistic_attributes
         
@@ -180,7 +191,8 @@ class KnowledgeExtractor:
         """Convert tensor to PIL Image (placeholder - implement based on your image format)"""
         # This is a placeholder - implement based on your image format
         # You might need to denormalize and convert to PIL
-        return tensor
+        # For now, return None to indicate we can't process this tensor
+        return None
 
 class KnowledgeFilter:
     def __init__(self, confidence_threshold=0.7, frequency_threshold=2):

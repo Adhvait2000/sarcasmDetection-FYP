@@ -227,7 +227,8 @@ class KnowledgeOnlyModel(nn.Module):
         self.knowledge_fusion = WeightedKnowledgeAttention(
             input_size=self.txt_out_size,
             num_heads=self.cro_heads,
-            dropout=self.cro_drop
+            dropout=self.cro_drop,
+            num_knowledge_types=len(self.knowledge_types)
         )
         
         # Align fused text (word-level) with knowledge (K nodes)
@@ -254,32 +255,43 @@ class KnowledgeOnlyModel(nn.Module):
             lam=self.lam
         )
         
-        # Fuse knowledge streams (still token-level)
+        # Fuse knowledge streams:
+        # - texts: (B, Lt, D)
+        # - knowledge_embeddings: (B, K, D)  ← per-type vectors from EnhancedTextEncoder (Option A)
+        # `WeightedKnowledgeAttention` expects (B, K, D), so this is now correct.
         fused_text, fused_knowledge, _ = self.knowledge_fusion(
             text_embeddings=texts,
             knowledge_embeddings=knowledge_embeddings,
-            knowledge_masks=knowledge_masks
+            knowledge_masks=None  # token masks no longer match K; drop or build a (B,K) mask if you have one
         )
 
-        # Pool fused_text tokens -> words to match masks/graphs
-        fused_text_word, knowledge_scores = pool_tokens_to_words_batch(
+        # Pool fused_text tokens -> words.
+        # IMPORTANT: pass a token-aligned score. `knowledge_scores` is per-type (B,K), so DO NOT use it here.
+        fused_text_word, text_scores_word = pool_tokens_to_words_batch(
             seq=fused_text,
-            score=knowledge_scores,
+            score=text_scores,  # <-- token-level weights from EnhancedTextEncoder
             word_spans=t1_word_seq,
             pad_len=mask_batch.size(1)
         )
 
+
         # Alignment returns [B, 2K] (two maps concatenated along last dim)
+        # Create dummy img_edge_index for knowledge-only model (no images)
+        batch_size = fused_knowledge.size(0)
+        num_knowledge = fused_knowledge.size(1)
+        dummy_img_edge_index = torch.zeros((batch_size, 2, 0), dtype=torch.long, device=fused_knowledge.device)
+        
         alignment_scores = self.knowledge_alignment(
             t2=fused_text_word,
-            v2=fused_knowledge,
+            v2=fused_knowledge,          # (B, K, D)
             edge_index=txt_edge_index,
             gnn_mask=gnn_mask,
-            score=knowledge_scores,
+            score=text_scores_word,      # token/word-aligned weights
             key_padding_mask=mask_batch,
             np_mask=np_mask,
+            img_edge_index=dummy_img_edge_index,
             lam=self.lam
-        )  # shape: [B, 2K]
+        ) # shape: [B, 2K]
 
         B, twoK = alignment_scores.shape
         if twoK == 0:

@@ -108,8 +108,8 @@ class MultiKnowledgeFusion(nn.Module):
         )
         
         # Reshape to separate knowledge types
-        attended_knowledge = attended_knowledge.view(batch_size, max_length, 
-                                                   self.num_knowledge_types, self.input_size)
+        attended_knowledge = attended_knowledge.reshape(batch_size, max_length, 
+                                                       self.num_knowledge_types, self.input_size)
         
         # Compute knowledge importance scores
         knowledge_scores = []
@@ -121,7 +121,7 @@ class MultiKnowledgeFusion(nn.Module):
         
         # Apply knowledge gate
         knowledge_weights = self.knowledge_gate(
-            attended_knowledge.view(batch_size, max_length, -1)
+            attended_knowledge.reshape(batch_size, max_length, -1)
         )  # (B, L, K)
         
         # Weighted combination
@@ -131,7 +131,7 @@ class MultiKnowledgeFusion(nn.Module):
         
         # Project to output size
         fused_knowledge = self.output_projection(
-            attended_knowledge.view(batch_size, max_length, -1)
+            attended_knowledge.reshape(batch_size, max_length, -1)
         )
         
         return fused_knowledge, knowledge_weights
@@ -176,7 +176,7 @@ class EnhancedTextEncoder(nn.Module):
         
         # Knowledge projection
         self.knowledge_projection = nn.Sequential(
-            nn.Linear(input_size, output_size),
+            nn.Linear(output_size, output_size),
             nn.LayerNorm(output_size),
             nn.Dropout(dropout)
         )
@@ -192,65 +192,58 @@ class EnhancedTextEncoder(nn.Module):
         self.importance_scorer = nn.Linear(output_size, 1)
         
     def forward(self, text_input, knowledge_inputs=None, knowledge_masks=None, lam=1):
-        """
-        Forward pass for enhanced text encoder
-        
-        Args:
-            text_input: Text input dictionary for BERT
-            knowledge_inputs: List of knowledge inputs
-            knowledge_masks: List of knowledge masks
-            lam: Temperature parameter for softmax
-            
-        Returns:
-            text_embeddings: Processed text embeddings
-            text_scores: Text importance scores
-            knowledge_embeddings: Processed knowledge embeddings
-            knowledge_scores: Knowledge importance scores
-        """
-        # Process main text
-        text_output = self.bert_model(**text_input)[0]
-        text_output = text_output[:, 1:-1, :]  # Remove [CLS] and [SEP]
-        
-        # Project text
-        text_embeddings = self.text_projection(text_output)
-        
-        # Compute text importance scores
-        text_scores = self.importance_scorer(text_embeddings).squeeze(-1)
+        # -------- Text branch --------
+        text_output = self.bert_model(**text_input)[0]         # (B, Lt+2, 768)
+        text_output = text_output[:, 1:-1, :]                  # remove [CLS], [SEP] -> (B, Lt, 768)
+
+        text_embeddings = self.text_projection(text_output)    # (B, Lt, D)
+        text_scores = self.importance_scorer(text_embeddings).squeeze(-1)  # (B, Lt)
         text_scores = F.softmax(text_scores * lam, dim=-1)
-        
-        # Process knowledge if available
+
+        # -------- Knowledge branch --------
         knowledge_embeddings = None
         knowledge_scores = None
-        
+
         if knowledge_inputs is not None:
-            # Process each knowledge type
+            # Encode each knowledge type with the same BERT
             knowledge_list = []
             for knowledge_input in knowledge_inputs:
                 if knowledge_input is not None:
-                    knowledge_output = self.bert_model(**knowledge_input)[0]
-                    knowledge_output = knowledge_output[:, 1:-1, :]
-                    knowledge_list.append(knowledge_output)
+                    k_out = self.bert_model(**knowledge_input)[0]   # (B, Lk+2, 768)
+                    k_out = k_out[:, 1:-1, :]                       # (B, Lk, 768)
+                    knowledge_list.append(k_out)
                 else:
-                    # Create dummy knowledge embedding
-                    dummy_knowledge = torch.zeros_like(text_output)
-                    knowledge_list.append(dummy_knowledge)
-            
-            # Fuse knowledge
-            fused_knowledge, knowledge_weights = self.knowledge_fusion(
-                knowledge_list, knowledge_masks
-            )
-            
-            # Project knowledge
-            knowledge_embeddings = self.knowledge_projection(fused_knowledge)
-            
-            # Compute knowledge importance scores
-            knowledge_scores = self.importance_scorer(knowledge_embeddings).squeeze(-1)
+                    # Fallback: zero-length => create a single zero token then pad later
+                    # To keep shapes simple, create a (B, 1, 768) zero tensor
+                    dummy = torch.zeros(text_output.size(0), 1, self.input_size, device=text_output.device, dtype=text_output.dtype)
+                    knowledge_list.append(dummy)
+
+            # Fuse across all knowledge tokens to get contextualized per-token knowledge reprs (B, L, 768)
+            fused_knowledge, knowledge_weights = self.knowledge_fusion(knowledge_list, knowledge_masks)
+            # fused_knowledge: (B, L, 768) ; knowledge_weights: (B, L, K)
+
+            # --- Option A pooling: turn (B, L, D) + (B, L, K) -> (B, K, D) ---
+            # First project fused tokens to D (to match downstream attention dimension)
+            fused_knowledge_proj = self.knowledge_projection(fused_knowledge)  # (B, L, D)
+
+            # Weighted average per knowledge type over sequence length
+            # type_embeddings[b,k,d] = sum_l fused_knowledge_proj[b,l,d] * weights[b,l,k] / sum_l weights[b,l,k]
+            eps = 1e-8
+            # einsum: (B,L,D) x (B,L,K) -> (B,K,D)
+            type_embeddings = torch.einsum('bld,blk->bkd', fused_knowledge_proj, knowledge_weights)
+            denom = knowledge_weights.sum(dim=1, keepdim=False).unsqueeze(-1) + eps  # (B, K, 1)
+            type_embeddings = type_embeddings / denom                                # (B, K, D)
+
+            # Per-type scores (optional; useful for diagnostics or further gating)
+            knowledge_embeddings = type_embeddings                                    # (B, K, D)
+            knowledge_scores = self.importance_scorer(knowledge_embeddings).squeeze(-1)  # (B, K)
             knowledge_scores = F.softmax(knowledge_scores * lam, dim=-1)
-        
+
         return text_embeddings, text_scores, knowledge_embeddings, knowledge_scores
 
+
 class WeightedKnowledgeAttention(nn.Module):
-    def __init__(self, input_size=768, num_heads=8, dropout=0.1):
+    def __init__(self, input_size=768, num_heads=8, dropout=0.1, num_knowledge_types=3):
         """
         Weighted attention mechanism for knowledge integration
         
@@ -258,11 +251,13 @@ class WeightedKnowledgeAttention(nn.Module):
             input_size: Input dimension size
             num_heads: Number of attention heads
             dropout: Dropout rate
+            num_knowledge_types: Number of knowledge types to handle
         """
         super(WeightedKnowledgeAttention, self).__init__()
         
         self.input_size = input_size
         self.num_heads = num_heads
+        self.num_knowledge_types = num_knowledge_types
         
         # Multi-head attention
         self.attention = nn.MultiheadAttention(
@@ -273,7 +268,7 @@ class WeightedKnowledgeAttention(nn.Module):
         )
         
         # Knowledge type weighting
-        self.knowledge_weights = nn.Parameter(torch.ones(3))  # caption, ANP, attribute
+        self.knowledge_weights = nn.Parameter(torch.ones(num_knowledge_types))
         self.knowledge_softmax = nn.Softmax(dim=0)
         
         # Output projection
