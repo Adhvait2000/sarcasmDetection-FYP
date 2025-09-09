@@ -407,8 +407,7 @@ class HybridModel(nn.Module):
         self.knowledge_output = nn.Linear(self.txt_out_size, 2)
         self.final_fusion = nn.Linear(4, 2)  # Combine both outputs
         
-    def forward(self, imgs, texts, mask_batch, img_edge_index, t1_word_seq,
-                txt_edge_index, gnn_mask, np_mask, knowledge_inputs, knowledge_masks):
+    def forward(self, imgs, texts, mask_batch, img_edge_index, t1_word_seq,txt_edge_index, gnn_mask, np_mask, knowledge_inputs, knowledge_masks):
         """
         Forward pass for hybrid model
         
@@ -461,12 +460,15 @@ class HybridModel(nn.Module):
         )
 
         # ▶︎ Pool fused_text to words for knowledge alignment
-        fused_text_word, knowledge_scores_word = pool_tokens_to_words_batch(
+        fused_text_word, fused_text_word_scores = pool_tokens_to_words_batch(
             seq=fused_text,
-            score=knowledge_scores,
+            score=text_scores,
             word_spans=t1_word_seq,
             pad_len=mask_batch.size(1)
         )
+
+        B = fused_knowledge.size(0)
+        dummy_img_edge_index = torch.zeros((B, 2, 0), dtype=torch.long, device=fused_knowledge.device)
 
         # Text-image alignment
         text_image_alignment = self.text_image_alignment(
@@ -487,9 +489,10 @@ class HybridModel(nn.Module):
             v2=fused_knowledge,
             edge_index=txt_edge_index,
             gnn_mask=gnn_mask,
-            score=knowledge_scores_word,
+            score=fused_text_word_scores,
             key_padding_mask=mask_batch,
             np_mask=np_mask,
+            img_edge_index=dummy_img_edge_index,
             lam=self.lam
         )
         
@@ -499,7 +502,16 @@ class HybridModel(nn.Module):
         
         # Generate predictions
         text_image_pred = self.text_image_output(weighted_text_image)
-        knowledge_pred = self.knowledge_output(knowledge_alignment)
+
+        B_, twoK = knowledge_alignment.shape
+        if twoK == 0:
+            knowledge_pred = torch.zeros(B_, 2, device=knowledge_alignment.device, dtype=knowledge_alignment.dtype)
+        else:
+            K = twoK // 2
+            a1 = knowledge_alignment[:, :K]   # [B, K]
+            a2 = knowledge_alignment[:, K:]   # [B, K]
+            stacked = torch.stack([a1, a2], dim=1)           # [B, 2, K]
+            knowledge_pred = F.adaptive_avg_pool1d(stacked, 1).squeeze(-1)  # [B, 2]
         
         # Final fusion
         combined_features = torch.cat([text_image_pred, knowledge_pred], dim=-1)

@@ -277,39 +277,122 @@ class WeightedKnowledgeAttention(nn.Module):
             nn.LayerNorm(input_size),
             nn.Dropout(dropout)
         )
+    def _build_per_type_mask(self, knowledge_masks, knowledge_embeddings):
+        # Return a boolean tensor [B, K] where True means "pad/ignore this type".
+        B, K, _ = knowledge_embeddings.shape
+        device = knowledge_embeddings.device
+
+        if knowledge_masks is None:
+            return torch.zeros(B, K, dtype=torch.bool, device=device)
+
+        if isinstance(knowledge_masks, list):
+            per_type = []
+            for m in knowledge_masks:
+                if m is None:
+                    # no tokens for this type -> mask it out
+                    per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
+                else:
+                    # assume m is [B, L_i] with True at PAD positions
+                    mb = m.to(device).bool()
+                    # if ALL positions are PAD for a sample, this type is effectively absent → mask=True
+                    all_pad = mb.all(dim=1, keepdim=True)  # [B,1]
+                    per_type.append(all_pad)
+            return torch.cat(per_type, dim=1)  # [B, K]
+
+        # If someone passes a tensor already, try to coerce to [B, K]
+        if torch.is_tensor(knowledge_masks):
+            km = knowledge_masks.to(device)
+            if km.dim() == 2 and km.size(1) == K:
+                return km.bool()
+            # Fallback: don't mask
+            return torch.zeros(B, K, dtype=torch.bool, device=device)
+
+        # Default: no mask
+        return torch.zeros(B, K, dtype=torch.bool, device=device)
         
     def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None):
         """
-        Forward pass for weighted knowledge attention
-        
         Args:
-            text_embeddings: Text embeddings (B, L, D)
-            knowledge_embeddings: Knowledge embeddings (B, K, D)
-            knowledge_masks: Knowledge masks (optional)
-            
+            text_embeddings: Tensor of shape [B, L, D]
+            knowledge_embeddings: Tensor of shape [B, K, D]  (one vector per knowledge type)
+            knowledge_masks: Optional list/tensor of masks. If a list, each element is a
+                            per-token mask for a knowledge type shaped [B, L_i] with True at PADs.
+                            We'll collapse it to a per-type mask [B, K] for MultiheadAttention.
         Returns:
-            attended_text: Text with knowledge attention
-            attended_knowledge: Knowledge with text attention
-            attention_weights: Attention weights
+            attended_text:       [B, L, D]
+            attended_knowledge:  [B, K, D]
+            text_attention:      attention weights from the text<-knowledge attention
         """
-        # Compute knowledge type weights
-        knowledge_type_weights = self.knowledge_softmax(self.knowledge_weights)
-        
-        # Apply knowledge type weighting
-        weighted_knowledge = knowledge_embeddings * knowledge_type_weights.unsqueeze(0).unsqueeze(-1)
-        
-        # Cross-attention between text and knowledge
+        B, L, D = text_embeddings.shape
+        Bk, K, Dk = knowledge_embeddings.shape
+        assert B == Bk and D == Dk, "Batch or embedding dims mismatch between text and knowledge."
+
+        device = knowledge_embeddings.device
+
+        # Compute (learned) knowledge-type weights and reweight knowledge embeddings
+        knowledge_type_weights = self.knowledge_softmax(self.knowledge_weights)             # [K]
+        weighted_knowledge = knowledge_embeddings * knowledge_type_weights.view(1, K, 1)   # [B, K, D]
+
+        # --- Build a proper key_padding_mask for keys of length K: [B, K] boolean ---
+        # True means "ignore/pad" per PyTorch's MultiheadAttention.
+        def _build_per_type_mask(k_masks, K_expected):
+            if k_masks is None:
+                return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
+
+            # If a list: each element is a per-token mask [B, L_i] for that type.
+            if isinstance(k_masks, list):
+                per_type = []
+                for m in k_masks:
+                    if m is None:
+                        # No tokens available for this type -> mask it out
+                        per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
+                    else:
+                        mb = m.to(device)
+                        if mb.dim() == 3 and mb.size(-1) == 1:
+                            mb = mb.squeeze(-1)  # [B, L_i]
+                        mb = mb.bool()
+                        # If ALL positions are PAD for a sample, this type is absent -> mask=True
+                        all_pad = mb.all(dim=1, keepdim=True)  # [B, 1]
+                        per_type.append(all_pad)
+                kp = torch.cat(per_type, dim=1)  # [B, K_list]
+                # Pad/crop to expected K if needed
+                if kp.size(1) < K_expected:
+                    pad = torch.zeros(B, K_expected - kp.size(1), dtype=torch.bool, device=device)
+                    kp = torch.cat([kp, pad], dim=1)
+                elif kp.size(1) > K_expected:
+                    kp = kp[:, :K_expected]
+                return kp
+
+            # If already a tensor, try to coerce to [B, K]
+            if torch.is_tensor(k_masks):
+                km = k_masks.to(device)
+                if km.dim() == 2 and km.size(0) == B and km.size(1) == K_expected:
+                    return km.bool()
+                # Fallback: no mask if shape is not compatible
+                return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
+
+            # Default: no mask
+            return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
+
+        kp_mask = _build_per_type_mask(knowledge_masks, K)  # [B, K], True=ignore
+
+        # Cross-attention: text attends to knowledge (keys/values length = K)
         attended_text, text_attention = self.attention(
-            text_embeddings, weighted_knowledge, weighted_knowledge,
-            key_padding_mask=knowledge_masks
-        )
-        
-        attended_knowledge, knowledge_attention = self.attention(
-            weighted_knowledge, text_embeddings, text_embeddings
-        )
-        
+            query=text_embeddings,                  # [B, L, D]
+            key=weighted_knowledge,                 # [B, K, D]
+            value=weighted_knowledge,               # [B, K, D]
+            key_padding_mask=kp_mask                # [B, K] boolean, True = ignore
+        )  # attended_text: [B, L, D]
+
+        # Reverse attention: knowledge attends to text (no key mask here; pad text earlier if needed)
+        attended_knowledge, _ = self.attention(
+            query=weighted_knowledge,               # [B, K, D]
+            key=text_embeddings,                    # [B, L, D]
+            value=text_embeddings                   # [B, L, D]
+        )  # attended_knowledge: [B, K, D]
+
         # Project outputs
-        attended_text = self.output_projection(attended_text)
-        attended_knowledge = self.output_projection(attended_knowledge)
-        
+        attended_text = self.output_projection(attended_text)            # [B, L, D]
+        attended_knowledge = self.output_projection(attended_knowledge)  # [B, K, D]
+
         return attended_text, attended_knowledge, text_attention
