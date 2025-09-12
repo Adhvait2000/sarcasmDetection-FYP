@@ -18,7 +18,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from model_enhanced import BaselineModel, KnowledgeOnlyModel, HybridModel
+from model_enhanced import BaselineModel, KnowledgeOnlyModel, HybridModel, ImageOnlyModel
 from utils.enhanced_dataset import EnhancedBaseSet, MultiKnowledgePadCollate
 from utils.data_utils import construct_edge_image, seed_everything
 from utils.compute_scores import get_metrics, get_four_metrics
@@ -98,6 +98,35 @@ class EnhancedTrainer:
                 lam=self.parameter["lambda"],
                 type_bmco=self.parameter["type_bmco"]
             )
+        elif self.model_type == "image_only":
+            return ImageOnlyModel(
+                img_input_dim=self.parameter["img_input_dim"],
+                img_inter_dim=self.parameter["img_inter_dim"],
+                img_out_dim=self.parameter["img_out_dim"],
+                img_patch=self.parameter["img_patch"],
+                drop=self.parameter.get("cro_drop", 0.5),
+                lam=self.parameter["lambda"],
+            )
+        elif self.model_type == "text_image":
+            return BaselineModel(
+                txt_input_dim=self.parameter["txt_input_dim"],
+                txt_out_size=self.parameter["txt_out_size"],
+                img_input_dim=self.parameter["img_input_dim"],
+                img_inter_dim=self.parameter["img_inter_dim"],
+                img_out_dim=self.parameter["img_out_dim"],
+                cro_layers=self.parameter["cro_layers"],
+                cro_heads=self.parameter["cro_heads"],
+                cro_drop=self.parameter["cro_drop"],
+                txt_gat_layer=self.parameter["txt_gat_layer"],
+                txt_gat_drop=self.parameter["txt_gat_drop"],
+                txt_gat_head=self.parameter["txt_gat_head"],
+                img_gat_layer=self.parameter["img_gat_layer"],
+                img_gat_drop=self.parameter["img_gat_drop"],
+                img_gat_head=self.parameter["img_gat_head"],
+                img_patch=self.parameter["img_patch"],
+                lam=self.parameter["lambda"],
+                type_bmco=self.parameter["type_bmco"]
+            )
         elif self.model_type == "knowledge_only":
             return KnowledgeOnlyModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
@@ -141,6 +170,8 @@ class EnhancedTrainer:
         """Get knowledge types based on model type"""
         if self.model_type == "baseline":
             return [0]  # Only captions
+        elif self.model_type in ["image_only", "text_image"]:
+            return []  # no external knowledge
         elif self.model_type == "knowledge_only":
             return [2, 3]  # ANP and attributes
         elif self.model_type == "hybrid":
@@ -255,6 +286,9 @@ class EnhancedTrainer:
                     knowledge_inputs=knowledge_inputs,
                     knowledge_masks=knowledge_masks
                 )
+            elif self.model_type == "image_only":
+                imgs = batch[0].to(device)
+                outputs = self.model(imgs=imgs)   # pass only images
             else:
                 # Baseline and hybrid models use images
                 imgs, texts, mask_batch, img_edge_index, t1_word_seq, txt_edge_index, \
@@ -324,6 +358,9 @@ class EnhancedTrainer:
                         knowledge_inputs=knowledge_inputs,
                         knowledge_masks=knowledge_masks
                     )
+                elif self.model_type == "image_only":
+                    imgs = batch[0].to(device)
+                    outputs = self.model(imgs=imgs)   # pass only images
                 else:
                     imgs, texts, mask_batch, img_edge_index, t1_word_seq, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
@@ -561,7 +598,7 @@ class EnhancedTrainer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', type=str, default='baseline',
-                       choices=['baseline', 'knowledge_only', 'hybrid'],
+                       choices=['baseline', 'knowledge_only', 'hybrid', 'image_only', 'text_image'],
                        help='Model type to train')
     parser.add_argument('--parameter_file', type=str, default='parameter.json',
                        help='Path to parameter file')

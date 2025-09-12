@@ -192,6 +192,36 @@ class BaselineModel(nn.Module):
         
         return predictions
 
+
+class ImageOnlyModel(nn.Module):
+    """
+    Image-Only ablation: classify using image encoder + simple pooling head.
+    """
+    def __init__(self, img_input_dim=768, img_inter_dim=500, img_out_dim=200, img_patch=49, drop=0.5, lam=1):
+        super().__init__()
+        self.img_encoder = ImageEncoder(
+            input_dim=img_input_dim,
+            inter_dim=img_inter_dim,
+            output_dim=img_out_dim
+        )
+        self.drop = nn.Dropout(drop)
+        self.fc = nn.Sequential(
+            nn.Linear(img_out_dim, img_out_dim),
+            nn.ReLU(),
+            nn.Dropout(drop),
+            nn.Linear(img_out_dim, 2)
+        )
+        self.lam = lam
+    
+    def forward(self, imgs, **_):
+        # v2: [B, K, D], pv: [B, K] (patch weights) — matches how you use it elsewhere
+        v2, pv = self.img_encoder(imgs, lam=self.lam)
+        # normalize weights and pool patches -> [B, D]
+        w = torch.softmax(pv, dim=1).unsqueeze(1)      # [B, 1, K]
+        pooled = torch.bmm(w, v2).squeeze(1)           # [B, D]
+        logits = self.fc(self.drop(pooled))            # [B, 2]
+        return logits
+
 class KnowledgeOnlyModel(nn.Module):
     """
     Knowledge-Only Model: ANPs + Attributes (no image patches)
