@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.optim as optim
 import torch
+import time
 from torch.nn import CrossEntropyLoss
 import numpy as np
 import json
@@ -177,7 +178,7 @@ class EnhancedTrainer:
             img_path=os.path.join(self.parameter["DATA_DIR"], val_img_file),
             knowledge_types=knowledge_types,
             max_knowledge_length=self.parameter.get("know_max_length", 20),
-            dataset_percentage=dataset_percentage,
+            dataset_percentage=1.0,
         )
 
         test_dataset = EnhancedBaseSet(
@@ -187,7 +188,7 @@ class EnhancedTrainer:
             img_path=os.path.join(self.parameter["DATA_DIR"], test_img_file),
             knowledge_types=knowledge_types,
             max_knowledge_length=self.parameter.get("know_max_length", 20),
-            dataset_percentage=dataset_percentage,
+            dataset_percentage=1.0,
         )
 
 
@@ -464,9 +465,9 @@ class EnhancedTrainer:
         # Create data loaders
         train_loader, val_loader, test_loader = self._create_data_loaders()
         
-        best_val_f1 = 0
-        best_epoch = 0
-        best_ckpt = None
+        best_val_f1 = float('-inf')
+        best_epoch = -1
+        best_ckpt_path = None
         epochs_no_improve = 0
         
         for epoch in range(num_epochs):
@@ -502,8 +503,10 @@ class EnhancedTrainer:
                 epochs_no_improve = 0
 
                 # Save best checkpoint & confusion matrix
-                if hasattr(self, "save_model"):
-                    best_ckpt_path = self.save_model(epoch, val_metrics)
+                best_ckpt_path = self.save_model(epoch, val_metrics)
+                print(f"[NEW BEST] epoch={epoch} val_f1={best_val_f1:.4f} -> saved {best_ckpt_path}")
+
+                # Confusion matrix for the best epoch
                 self.plot_confusion_matrix(
                     val_metrics['confusion_matrix'],
                     f"confusion_matrix_{self.model_type}_epoch_{epoch}.png"
@@ -520,7 +523,12 @@ class EnhancedTrainer:
         if best_ckpt_path is not None:
             ckpt = torch.load(best_ckpt_path, map_location=device)
             self.model.load_state_dict(ckpt['model_state_dict'])
-            print(f"\nLoaded best checkpoint from epoch {best_epoch} for final test.")
+            best_epoch = ckpt.get('epoch', best_epoch)
+            best_val_f1 = ckpt.get('metrics', {}).get('f1', best_val_f1)
+            print(f"\nLoaded best checkpoint from epoch {best_epoch} (val_f1={best_val_f1:.4f}) for final test.")
+        else:
+            print("\n[WARN] No best checkpoint found; testing current model.")
+
         
         # Test on best model
         print(f"\nTesting best model (epoch {best_epoch})...")
@@ -533,6 +541,7 @@ class EnhancedTrainer:
         print(f"F1: {test_metrics['f1']:.4f}")
         
         # Save final results
+        stamp = time.strftime("%Y%m%d-%H%M%S")
         results = {
             'model_type': self.model_type,
             'best_epoch': best_epoch,
@@ -540,8 +549,12 @@ class EnhancedTrainer:
             'test_metrics': test_metrics
         }
         
+        path_ts = f"results_{self.model_type}_{stamp}.json"
+        with open(path_ts, 'w') as f:
+            json.dump(results, f, indent=2)
         with open(f"results_{self.model_type}.json", 'w') as f:
             json.dump(results, f, indent=2)
+        print(f"[RESULTS] Saved: {os.path.abspath(path_ts)}")
         
         return results
 
