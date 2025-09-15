@@ -50,10 +50,30 @@ class EnhancedTrainer:
         self.model = self._initialize_model()
         self.model.to(device=device)
         
-        # Initialize optimizer and scheduler
-        self.optimizer = optim.Adam(
-            params=self.model.parameters(),
-            lr=self.parameter["lr"],
+        # Differential LR groups (BERT vs new heads) + AdamW
+        head_lr = self.parameter.get("head_lr", 1e-3)
+        bert_params, new_params = [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "bert_model" in n:
+                bert_params.append(p)
+            else:
+                new_params.append(p)
+        param_groups = []
+        if bert_params:
+            param_groups.append({"params": bert_params, "lr": self.parameter["lr"]})
+        if new_params:
+            # If you want this only for hybrid, swap next line to:
+            group_lr = head_lr if self.model_type == "hybrid" else self.parameter["lr"]
+            # group_lr = head_lr
+            param_groups.append({"params": new_params, "lr": group_lr})
+        if not param_groups:
+            param_groups = [{"params": self.model.parameters(), "lr": self.parameter["lr"]}]
+        
+        
+        self.optimizer = optim.AdamW(
+            param_groups,
             betas=(0.9, 0.999),
             eps=1e-8,
             weight_decay=self.parameter["weight_decay"],
@@ -318,6 +338,10 @@ class EnhancedTrainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.parameter.get("enhanced_model_config", {}).get("max_grad_norm", 1.0)
+            )
             self.optimizer.step()
             
             # Statistics

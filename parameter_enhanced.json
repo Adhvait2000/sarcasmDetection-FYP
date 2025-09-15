@@ -22,7 +22,7 @@
     
     "cro_layers": 6,
     "cro_heads": 5,
-    "cro_drop": 0.5,
+    "cro_drop": 0.4,
     
     "txt_gat_layer": 2,
     "txt_gat_drop": 0.5,
@@ -37,6 +37,7 @@
     
     "lambda": 1,
     "type_bmco": 1,
+    "head_lr": 0.001,
     
     "knowledge_type": 4,
     "know_max_length": 20,

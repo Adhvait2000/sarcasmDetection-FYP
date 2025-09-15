@@ -527,6 +527,7 @@ class HybridModel(nn.Module):
         )
         
         # Apply importance weights
+        pv = torch.softmax(pv, dim=1)     
         pv = pv.repeat(1, 2)
         weighted_text_image = text_image_alignment * pv
         
@@ -636,7 +637,16 @@ class Alignment(nn.Module):
         # token importance
         pa_token = self.linear1(t2).squeeze(-1)  # [B,L]
         pa_token = pa_token.masked_fill(key_padding_mask, float("-inf"))
-        pa_token = F.softmax(pa_token * lam, dim=1).unsqueeze(2).expand(B, L, v2.size(1))  # [B,L,K]
+
+        # NEW: safe softmax
+        logits = pa_token * lam
+        probs = F.softmax(logits, dim=1)
+        probs = torch.nan_to_num(probs, nan=0.0)
+        row_sums = probs.sum(dim=-1, keepdim=True)
+        probs = torch.where(row_sums == 0, torch.full_like(probs, 1.0 / probs.size(-1)), probs)
+
+        pa_token = probs.unsqueeze(2).expand(B, L, v2.size(1))
+
 
         # text GAT
         tnp = t2
@@ -668,15 +678,29 @@ class Alignment(nn.Module):
         q2 = torch.bmm(tnp, v3.permute(0, 2, 1)) / math.sqrt(float(tnp.size(2)))  # [B,L+1,K]
 
         # NP importance
-        pa_np = self.linear2(tnp).squeeze(-1)  # [B,L+1]
+        pa_np = self.linear2(tnp).squeeze(-1)  # [B, L+1]
         if (np_mask is None) or (np_mask.size(1) != tnp.size(1)):
             np_mask = torch.zeros_like(pa_np, dtype=torch.bool, device=dev)
         else:
             np_mask = np_mask.to(dev).bool()
-        pa_np = pa_np.masked_fill(np_mask, float("-inf"))
-        pa_np = F.softmax(pa_np * lam, dim=1).unsqueeze(2).expand(B, tnp.size(1), v3.size(1))  # [B,L+1,K]
 
-        a_1 = torch.sum(q1 * pa_token, dim=1)  # [B,K]
-        a_2 = torch.sum(q2 * pa_np,   dim=1)   # [B,K]
-        return torch.cat([a_1, a_2], dim=1)    # [B,2K]
+        pa_np = pa_np.masked_fill(np_mask, float("-inf"))
+
+        # safe softmax over (L+1)
+        logits = pa_np * lam                                    
+        probs  = F.softmax(logits, dim=1)                       
+        probs  = torch.nan_to_num(probs, nan=0.0)               
+        row_sums = probs.sum(dim=-1, keepdim=True)              
+        probs  = torch.where(                                   
+            row_sums == 0,
+            torch.full_like(probs, 1.0 / probs.size(-1)),
+            probs
+        )
+
+        pa_np = probs.unsqueeze(2).expand(B, tnp.size(1), v3.size(1))  # [B, L+1, K]
+
+        a_1 = torch.sum(q1 * pa_token, dim=1)  # [B, K]
+        a_2 = torch.sum(q2 * pa_np,   dim=1)   # [B, K]
+        return torch.cat([a_1, a_2], dim=1)    # [B, 2K]
+
 

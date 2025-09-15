@@ -197,8 +197,18 @@ class EnhancedTextEncoder(nn.Module):
         text_output = text_output[:, 1:-1, :]                  # remove [CLS], [SEP] -> (B, Lt, 768)
 
         text_embeddings = self.text_projection(text_output)    # (B, Lt, D)
+
         text_scores = self.importance_scorer(text_embeddings).squeeze(-1)  # (B, Lt)
-        text_scores = F.softmax(text_scores * lam, dim=-1)
+
+        # NEW: safe softmax
+        logits = text_scores * lam
+        probs = F.softmax(logits, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0)  # replace NaN with 0
+        row_sums = probs.sum(dim=-1, keepdim=True)
+        probs = torch.where(row_sums == 0, torch.full_like(probs, 1.0 / probs.size(-1)), probs)
+
+        text_scores = probs
+
 
         # -------- Knowledge branch --------
         knowledge_embeddings = None
@@ -277,38 +287,38 @@ class WeightedKnowledgeAttention(nn.Module):
             nn.LayerNorm(input_size),
             nn.Dropout(dropout)
         )
-    def _build_per_type_mask(self, knowledge_masks, knowledge_embeddings):
-        # Return a boolean tensor [B, K] where True means "pad/ignore this type".
-        B, K, _ = knowledge_embeddings.shape
-        device = knowledge_embeddings.device
+    # def _build_per_type_mask(self, knowledge_masks, knowledge_embeddings):
+    #     # Return a boolean tensor [B, K] where True means "pad/ignore this type".
+    #     B, K, _ = knowledge_embeddings.shape
+    #     device = knowledge_embeddings.device
 
-        if knowledge_masks is None:
-            return torch.zeros(B, K, dtype=torch.bool, device=device)
+    #     if knowledge_masks is None:
+    #         return torch.zeros(B, K, dtype=torch.bool, device=device)
 
-        if isinstance(knowledge_masks, list):
-            per_type = []
-            for m in knowledge_masks:
-                if m is None:
-                    # no tokens for this type -> mask it out
-                    per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
-                else:
-                    # assume m is [B, L_i] with True at PAD positions
-                    mb = m.to(device).bool()
-                    # if ALL positions are PAD for a sample, this type is effectively absent → mask=True
-                    all_pad = mb.all(dim=1, keepdim=True)  # [B,1]
-                    per_type.append(all_pad)
-            return torch.cat(per_type, dim=1)  # [B, K]
+    #     if isinstance(knowledge_masks, list):
+    #         per_type = []
+    #         for m in knowledge_masks:
+    #             if m is None:
+    #                 # no tokens for this type -> mask it out
+    #                 per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
+    #             else:
+    #                 # assume m is [B, L_i] with True at PAD positions
+    #                 mb = m.to(device).bool()
+    #                 # if ALL positions are PAD for a sample, this type is effectively absent → mask=True
+    #                 all_pad = mb.all(dim=1, keepdim=True)  # [B,1]
+    #                 per_type.append(all_pad)
+    #         return torch.cat(per_type, dim=1)  # [B, K]
 
-        # If someone passes a tensor already, try to coerce to [B, K]
-        if torch.is_tensor(knowledge_masks):
-            km = knowledge_masks.to(device)
-            if km.dim() == 2 and km.size(1) == K:
-                return km.bool()
-            # Fallback: don't mask
-            return torch.zeros(B, K, dtype=torch.bool, device=device)
+    #     # If someone passes a tensor already, try to coerce to [B, K]
+    #     if torch.is_tensor(knowledge_masks):
+    #         km = knowledge_masks.to(device)
+    #         if km.dim() == 2 and km.size(1) == K:
+    #             return km.bool()
+    #         # Fallback: don't mask
+    #         return torch.zeros(B, K, dtype=torch.bool, device=device)
 
-        # Default: no mask
-        return torch.zeros(B, K, dtype=torch.bool, device=device)
+    #     # Default: no mask
+    #     return torch.zeros(B, K, dtype=torch.bool, device=device)
         
     def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None):
         """
@@ -375,24 +385,27 @@ class WeightedKnowledgeAttention(nn.Module):
             return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
 
         kp_mask = _build_per_type_mask(knowledge_masks, K)  # [B, K], True=ignore
+        kp_mask = kp_mask.to(weighted_knowledge.device).bool()
+
+        all_masked = kp_mask.all(dim=1)  # [B]
+        if all_masked.any():
+            fix_idx = all_masked.nonzero(as_tuple=False).squeeze(-1)
+            kp_mask[fix_idx, 0] = False
 
         # Cross-attention: text attends to knowledge (keys/values length = K)
         attended_text, text_attention = self.attention(
-            query=text_embeddings,                  # [B, L, D]
-            key=weighted_knowledge,                 # [B, K, D]
-            value=weighted_knowledge,               # [B, K, D]
-            key_padding_mask=kp_mask                # [B, K] boolean, True = ignore
-        )  # attended_text: [B, L, D]
+            query=text_embeddings, key=weighted_knowledge, value=weighted_knowledge, key_padding_mask=kp_mask
+        )
+        attended_text = torch.nan_to_num(attended_text, 0.0)              # NEW: nan guard
+        attended_text = torch.clamp(attended_text, -1e4, 1e4)             # NEW: clamp extremes
+        attended_text = self.output_projection(attended_text)              # NEW: actually use projection
 
-        # Reverse attention: knowledge attends to text (no key mask here; pad text earlier if needed)
+        # Reverse attention: knowledge attends to text
         attended_knowledge, _ = self.attention(
-            query=weighted_knowledge,               # [B, K, D]
-            key=text_embeddings,                    # [B, L, D]
-            value=text_embeddings                   # [B, L, D]
-        )  # attended_knowledge: [B, K, D]
-
-        # Project outputs
-        attended_text = self.output_projection(attended_text)            # [B, L, D]
-        attended_knowledge = self.output_projection(attended_knowledge)  # [B, K, D]
+            query=weighted_knowledge, key=text_embeddings, value=text_embeddings
+        )
+        attended_knowledge = torch.nan_to_num(attended_knowledge, 0.0)    # NEW: nan guard
+        attended_knowledge = torch.clamp(attended_knowledge, -1e4, 1e4)   # NEW: clamp extremes
+        attended_knowledge = self.output_projection(attended_knowledge)    # NEW: use projection
 
         return attended_text, attended_knowledge, text_attention
