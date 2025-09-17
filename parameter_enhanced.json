@@ -6,13 +6,14 @@
     "model_name": "Enhanced_KEHM",
     
     "patience": 3,
-    "batch_size": 4,
+    "batch_size": 32,
     "epochs": 10,
     "max_length": 120,
     "use_np": false,
     "seed": 42,
-    "weight_decay": 0.005,
+    "weight_decay": 0.01,
     "lr": 2e-5,
+    "head_lr": 1e-4,
     
     "txt_input_dim": 768,
     "txt_out_size": 200,
@@ -37,7 +38,6 @@
     
     "lambda": 1,
     "type_bmco": 1,
-    "head_lr": 0.001,
     
     "knowledge_type": 4,
     "know_max_length": 20,
@@ -48,7 +48,7 @@
     "know_cro_type": 0,
     "visualization": false,
     
-    "dataset_percentage": 50.0,
+    "dataset_percentage": 100.0,
     
     "train_img_file": "train_B32.pt",
     "val_img_file": "val_B32.pt", 

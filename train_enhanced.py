@@ -50,33 +50,32 @@ class EnhancedTrainer:
         self.model = self._initialize_model()
         self.model.to(device=device)
         
-        # Differential LR groups (BERT vs new heads) + AdamW
-        head_lr = self.parameter.get("head_lr", 1e-3)
+        # Setup optimizer with proper learning rates
+        head_lr = self.parameter.get("head_lr", self.parameter["lr"])
         bert_params, new_params = [], []
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "bert_model" in n:
+            if "bert_model" in n or "bert" in n.lower():
                 bert_params.append(p)
             else:
                 new_params.append(p)
+        
         param_groups = []
         if bert_params:
             param_groups.append({"params": bert_params, "lr": self.parameter["lr"]})
         if new_params:
-            # If you want this only for hybrid, swap next line to:
-            group_lr = head_lr if self.model_type == "hybrid" else self.parameter["lr"]
-            # group_lr = head_lr
+            # Use head_lr only if specified and for hybrid model
+            group_lr = head_lr if (self.model_type == "hybrid" and "head_lr" in self.parameter) else self.parameter["lr"]
             param_groups.append({"params": new_params, "lr": group_lr})
         if not param_groups:
             param_groups = [{"params": self.model.parameters(), "lr": self.parameter["lr"]}]
-        
         
         self.optimizer = optim.AdamW(
             param_groups,
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=self.parameter["weight_decay"],
+            weight_decay=self.parameter.get("weight_decay", 0.005),
             amsgrad=True
         )
         
@@ -84,7 +83,7 @@ class EnhancedTrainer:
             self.optimizer,
             mode='min',
             factor=0.1,
-            patience=self.parameter["patience"]
+            patience=self.parameter.get("patience", 3)
         )
         
         self.criterion = CrossEntropyLoss()
@@ -93,8 +92,8 @@ class EnhancedTrainer:
         self.logger = Logger(f"logs/{model_type}_training")
 
         # Early Stopping parameters
-        self.early_stopping_patience = self.parameter.get("early_stopping_patience", 3)
-        self.early_stop_min_delta   = self.parameter.get("early_stop_min_delta", 0.001)
+        self.early_stopping_patience = self.parameter.get("early_stopping_patience", 5)
+        self.early_stop_min_delta = self.parameter.get("early_stop_min_delta", 0.001)
         
     def _initialize_model(self):
         """Initialize model based on type"""
@@ -201,15 +200,18 @@ class EnhancedTrainer:
         """Create data loaders for the specific model type"""
         knowledge_types = self._get_knowledge_types()
 
-        # Normalize dataset_percentage (accept 50 or 0.5)
-        raw_pct = self.parameter.get("dataset_percentage", 100.0)
-        dataset_percentage = raw_pct if raw_pct <= 1.0 else raw_pct / 100.0
-        print(f"Dataset sampling: configured {dataset_percentage*100:.1f}% (raw={raw_pct})")
+        # Dataset percentage handling
+        dataset_percentage = self.parameter.get("dataset_percentage", 100.0)
+        if dataset_percentage > 1.0:
+            dataset_percentage = dataset_percentage / 100.0
+        
+        print(f"Dataset sampling: {dataset_percentage*100:.1f}%")
+        print(f"Knowledge types for {self.model_type}: {knowledge_types}")
 
         # File names 
         train_img_file = self.parameter.get("train_img_file", "train_B32.pt")
-        val_img_file   = self.parameter.get("val_img_file",   "val_B32.pt")
-        test_img_file  = self.parameter.get("test_img_file",  "test_B32.pt")
+        val_img_file = self.parameter.get("val_img_file", "val_B32.pt")
+        test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
 
         # Datasets
         train_dataset = EnhancedBaseSet(
@@ -242,22 +244,21 @@ class EnhancedTrainer:
             dataset_percentage=1.0,
         )
 
-
         # Collate
         collate_fn = MultiKnowledgePadCollate(
             knowledge_types=knowledge_types,
             max_knowledge_length=self.parameter.get("know_max_length", 20),
         )
 
-        # num_workers configurable; 0 is the safest on macOS
-        nw = self.parameter.get("num_workers", 0)
-
+        # DataLoaders
+        num_workers = self.parameter.get("num_workers", 0)
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.parameter["batch_size"],
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=nw,
+            num_workers=num_workers,
         )
 
         val_loader = DataLoader(
@@ -265,7 +266,7 @@ class EnhancedTrainer:
             batch_size=self.parameter["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=nw,
+            num_workers=num_workers,
         )
 
         test_loader = DataLoader(
@@ -273,12 +274,32 @@ class EnhancedTrainer:
             batch_size=self.parameter["batch_size"],
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=nw,
+            num_workers=num_workers,
         )
 
+        print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}, Test batches: {len(test_loader)}")
+        
         return train_loader, val_loader, test_loader
 
-    
+    def _construct_image_edge_index(self, batch_size, num_patches=49):
+            """
+            Construct image edge indices for the batch using the existing construct_edge_image function.
+            """
+            # Use the existing construct_edge_image function from data_utils
+            # This creates edges connecting each patch to its 8 neighbors in the grid
+            single_edge_index = construct_edge_image(num_patches)  # Returns [2, num_edges]
+            
+            # Replicate for each sample in the batch
+            batch_edge_indices = []
+            for b in range(batch_size):
+                batch_edge_indices.append(single_edge_index)
+            
+            # Stack into batch tensor [B, 2, E]
+            # All samples have the same edge structure for images
+            batch_tensor = torch.stack([single_edge_index for _ in range(batch_size)])
+            
+            return batch_tensor
+        
     def train_epoch(self, train_loader):
         """Train for one epoch"""
         self.model.train()
@@ -288,18 +309,22 @@ class EnhancedTrainer:
         
         progress_bar = tqdm(train_loader, desc="Training")
         
-        for batch in progress_bar:
-            # Unpack batch data
+        for batch_idx, batch in enumerate(progress_bar):
+            # Debug first batch
+            if batch_idx == 0:
+                print(f"\nFirst batch shapes:")
+                print(f"  Images: {batch[0].shape if len(batch) > 0 else 'None'}")
+                print(f"  Batch length: {len(batch)}")
+            
+            # Unpack batch data based on model type
             if self.model_type == "knowledge_only":
-                # Knowledge-only model doesn't use images
-                texts, mask_batch, t1_word_seq, txt_edge_index, gnn_mask, np_mask, \
+                texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                 knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
                 
-                # Forward pass
                 outputs = self.model(
                     texts=texts,
                     mask_batch=mask_batch,
-                    t1_word_seq=t1_word_seq,
+                    t1_word_seq=word_spans,
                     txt_edge_index=txt_edge_index,
                     gnn_mask=gnn_mask,
                     np_mask=np_mask,
@@ -308,19 +333,23 @@ class EnhancedTrainer:
                 )
             elif self.model_type == "image_only":
                 imgs = batch[0].to(device)
-                outputs = self.model(imgs=imgs)   # pass only images
+                outputs = self.model(imgs=imgs)
             else:
-                # Baseline and hybrid models use images
-                imgs, texts, mask_batch, img_edge_index, t1_word_seq, txt_edge_index, \
+                # Baseline, text_image, and hybrid models
+                imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                 gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
                 
-                # Forward pass
+                # Debug shapes for first batch
+                if batch_idx == 0:
+                    print(f"  Prepared imgs: {imgs.shape}")
+                    print(f"  img_edge_index: {img_edge_index.shape}")
+                
                 outputs = self.model(
                     imgs=imgs,
                     texts=texts,
                     mask_batch=mask_batch,
                     img_edge_index=img_edge_index,
-                    t1_word_seq=t1_word_seq,
+                    t1_word_seq=word_spans,
                     txt_edge_index=txt_edge_index,
                     gnn_mask=gnn_mask,
                     np_mask=np_mask,
@@ -328,9 +357,8 @@ class EnhancedTrainer:
                     knowledge_masks=knowledge_masks
                 )
             
-            # Get labels (labels are always at index 8)
-            labels = batch[8]
-            labels = labels.to(device)
+            # Get labels (always at index 8)
+            labels = batch[8].to(device)
             
             # Compute loss
             loss = self.criterion(outputs, labels)
@@ -338,10 +366,11 @@ class EnhancedTrainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.parameter.get("enhanced_model_config", {}).get("max_grad_norm", 1.0)
-            )
+            
+            # Gradient clipping
+            max_grad_norm = self.parameter.get("enhanced_model_config", {}).get("max_grad_norm", 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+            
             self.optimizer.step()
             
             # Statistics
@@ -367,15 +396,15 @@ class EnhancedTrainer:
         
         with torch.no_grad():
             for batch in tqdm(data_loader, desc=f"Evaluating {split}"):
-                # Prepare batch
+                # Prepare batch based on model type
                 if self.model_type == "knowledge_only":
-                    texts, mask_batch, t1_word_seq, txt_edge_index, gnn_mask, np_mask, \
+                    texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                     knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
                     
                     outputs = self.model(
                         texts=texts,
                         mask_batch=mask_batch,
-                        t1_word_seq=t1_word_seq,
+                        t1_word_seq=word_spans,
                         txt_edge_index=txt_edge_index,
                         gnn_mask=gnn_mask,
                         np_mask=np_mask,
@@ -384,9 +413,9 @@ class EnhancedTrainer:
                     )
                 elif self.model_type == "image_only":
                     imgs = batch[0].to(device)
-                    outputs = self.model(imgs=imgs)   # pass only images
+                    outputs = self.model(imgs=imgs)
                 else:
-                    imgs, texts, mask_batch, img_edge_index, t1_word_seq, txt_edge_index, \
+                    imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
                     
                     outputs = self.model(
@@ -394,7 +423,7 @@ class EnhancedTrainer:
                         texts=texts,
                         mask_batch=mask_batch,
                         img_edge_index=img_edge_index,
-                        t1_word_seq=t1_word_seq,
+                        t1_word_seq=word_spans,
                         txt_edge_index=txt_edge_index,
                         gnn_mask=gnn_mask,
                         np_mask=np_mask,
@@ -403,15 +432,13 @@ class EnhancedTrainer:
                     )
                 
                 # Get labels
-                # labels = batch[-1] if self.model_type == "knowledge_only" else batch[8]
-                # labels = labels.to(device)
                 labels = batch[8].to(device)
                 
                 # Compute loss
                 loss = self.criterion(outputs, labels)
                 total_loss += loss.item()
                 
-                # Store predictions and labels
+                # Store predictions
                 _, predicted = torch.max(outputs.data, 1)
                 all_predictions.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
@@ -422,7 +449,7 @@ class EnhancedTrainer:
             all_labels, all_predictions, average='weighted'
         )
         
-        # Create confusion matrix
+        # Confusion matrix
         cm = confusion_matrix(all_labels, all_predictions)
         
         return {
@@ -435,16 +462,22 @@ class EnhancedTrainer:
         }
     
     def _prepare_batch(self, batch):
-        """Prepare batch for baseline and hybrid models"""
+        """
+        FIXED: Properly prepare batch for baseline and hybrid models
+        """
         imgs = batch[0].to(device)
         texts = batch[1]
         word_spans = batch[2]
         word_len = batch[3]
         mask_batch = batch[4].to(device)
-        edge_cap1 = batch[5]
-        gnn_mask_1 = batch[6].to(device)
-        np_mask_1 = batch[7].to(device)
-        labels = batch[8]
+        txt_edge_index = batch[5]  # This is text edge index
+        gnn_mask = batch[6].to(device)
+        np_mask = batch[7].to(device)
+        
+        # CRITICAL FIX: Construct proper image edge indices
+        batch_size = imgs.size(0)
+        img_edge_index = self._construct_image_edge_index(batch_size, self.parameter["img_patch"])
+        img_edge_index = img_edge_index.to(device)
         
         # Handle knowledge data
         knowledge_inputs = None
@@ -458,13 +491,16 @@ class EnhancedTrainer:
             for i in range(9, len(batch), 3):
                 if i < len(batch) and batch[i] is not None:
                     knowledge_inputs.append(batch[i])
-                    knowledge_masks.append(batch[i+2].to(device) if batch[i+2] is not None else None)
+                    if i+2 < len(batch) and batch[i+2] is not None:
+                        knowledge_masks.append(batch[i+2].to(device))
+                    else:
+                        knowledge_masks.append(None)
                 else:
                     knowledge_inputs.append(None)
                     knowledge_masks.append(None)
         
-        return imgs, texts, mask_batch, edge_cap1, word_spans, edge_cap1, \
-               gnn_mask_1, np_mask_1, knowledge_inputs, knowledge_masks
+        return imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
+               gnn_mask, np_mask, knowledge_inputs, knowledge_masks
     
     def _prepare_knowledge_only_batch(self, batch):
         """Prepare batch for knowledge-only model"""
@@ -472,9 +508,9 @@ class EnhancedTrainer:
         word_spans = batch[2]
         word_len = batch[3]
         mask_batch = batch[4].to(device)
-        edge_cap1 = batch[5]
-        gnn_mask_1 = batch[6].to(device)
-        np_mask_1 = batch[7].to(device)
+        txt_edge_index = batch[5]
+        gnn_mask = batch[6].to(device)
+        np_mask = batch[7].to(device)
         
         # Handle knowledge data
         knowledge_inputs = []
@@ -484,15 +520,19 @@ class EnhancedTrainer:
             for i in range(9, len(batch), 3):
                 if i < len(batch) and batch[i] is not None:
                     knowledge_inputs.append(batch[i])
-                    knowledge_masks.append(batch[i+2].to(device) if batch[i+2] is not None else None)
+                    if i+2 < len(batch) and batch[i+2] is not None:
+                        knowledge_masks.append(batch[i+2].to(device))
+                    else:
+                        knowledge_masks.append(None)
                 else:
                     knowledge_inputs.append(None)
                     knowledge_masks.append(None)
         
-        return texts, mask_batch, word_spans, edge_cap1, gnn_mask_1, np_mask_1, \
+        return texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                knowledge_inputs, knowledge_masks
     
     def save_model(self, epoch, metrics, save_dir="saved_models"):
+        """Save model checkpoint"""
         os.makedirs(save_dir, exist_ok=True)
         checkpoint = {
             'epoch': epoch,
@@ -506,7 +546,6 @@ class EnhancedTrainer:
         path = f"{save_dir}/{self.model_type}_epoch_{epoch}.pt"
         torch.save(checkpoint, path)
         return path
-
     
     def plot_confusion_matrix(self, cm, save_path):
         """Plot and save confusion matrix"""
@@ -521,7 +560,11 @@ class EnhancedTrainer:
     
     def train(self, num_epochs):
         """Main training loop"""
-        print(f"Training {self.model_type} model...")
+        print(f"\nTraining {self.model_type} model...")
+        print(f"Device: {device}")
+        print(f"Batch size: {self.parameter['batch_size']}")
+        print(f"Learning rate: {self.parameter['lr']}")
+        print(f"Epochs: {num_epochs}")
         
         # Create data loaders
         train_loader, val_loader, test_loader = self._create_data_loaders()
@@ -532,7 +575,9 @@ class EnhancedTrainer:
         epochs_no_improve = 0
         
         for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch+1}/{num_epochs}")
+            print(f"{'='*50}")
             
             # Train
             train_loss, train_acc = self.train_epoch(train_loader)
@@ -550,72 +595,72 @@ class EnhancedTrainer:
             self.logger.log_scalar('val_acc', val_metrics['accuracy'], epoch)
             self.logger.log_scalar('val_f1', val_metrics['f1'], epoch)
             
-            print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+            print(f"\nTrain Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
             print(f"Val Loss: {val_metrics['loss']:.4f}, Val Acc: {val_metrics['accuracy']:.4f}")
             print(f"Val Precision: {val_metrics['precision']:.4f}, Val Recall: {val_metrics['recall']:.4f}")
             print(f"Val F1: {val_metrics['f1']:.4f}")
             
-
-            # ---- Early stopping check (on F1 with min_delta) ----
-            improved = (val_metrics['f1'] - best_val_f1) > getattr(self, "early_stop_min_delta", 0.0)
+            # Check for improvement
+            improved = (val_metrics['f1'] - best_val_f1) > self.early_stop_min_delta
             if improved:
                 best_val_f1 = val_metrics['f1']
                 best_epoch = epoch
                 epochs_no_improve = 0
-
-                # Save best checkpoint & confusion matrix
+                
+                # Save best model
                 best_ckpt_path = self.save_model(epoch, val_metrics)
-                print(f"[NEW BEST] epoch={epoch} val_f1={best_val_f1:.4f} -> saved {best_ckpt_path}")
-
-                # Confusion matrix for the best epoch
+                print(f"\n[NEW BEST] Saved model with Val F1: {best_val_f1:.4f}")
+                
+                # Save confusion matrix
                 self.plot_confusion_matrix(
                     val_metrics['confusion_matrix'],
-                    f"confusion_matrix_{self.model_type}_epoch_{epoch}.png"
+                    f"confusion_matrix_{self.model_type}_best.png"
                 )
             else:
                 epochs_no_improve += 1
-                if epochs_no_improve >= getattr(self, "early_stopping_patience", 3):
-                    print(f"Early stopping triggered at epoch {epoch+1} "
-                        f"(no val F1 improvement > {getattr(self, 'early_stop_min_delta', 0.0)} "
-                        f"for {epochs_no_improve} epochs).")
+                print(f"No improvement for {epochs_no_improve} epoch(s)")
+                
+                if epochs_no_improve >= self.early_stopping_patience:
+                    print(f"\nEarly stopping triggered at epoch {epoch+1}")
                     break
-
-        # ---- Reload best checkpoint before testing ----
-        if best_ckpt_path is not None:
-            ckpt = torch.load(best_ckpt_path, map_location=device)
-            self.model.load_state_dict(ckpt['model_state_dict'])
-            best_epoch = ckpt.get('epoch', best_epoch)
-            best_val_f1 = ckpt.get('metrics', {}).get('f1', best_val_f1)
-            print(f"\nLoaded best checkpoint from epoch {best_epoch} (val_f1={best_val_f1:.4f}) for final test.")
-        else:
-            print("\n[WARN] No best checkpoint found; testing current model.")
-
         
-        # Test on best model
-        print(f"\nTesting best model (epoch {best_epoch})...")
+        # Load best model for testing
+        if best_ckpt_path:
+            checkpoint = torch.load(best_ckpt_path, map_location=device)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"\nLoaded best model from epoch {best_epoch+1}")
+        
+        # Test evaluation
+        print(f"\n{'='*50}")
+        print(f"Testing best model (epoch {best_epoch+1})")
+        print(f"{'='*50}")
+        
         test_metrics = self.evaluate(test_loader, "test")
         
-        print(f"Test Results:")
-        print(f"Accuracy: {test_metrics['accuracy']:.4f}")
-        print(f"Precision: {test_metrics['precision']:.4f}")
-        print(f"Recall: {test_metrics['recall']:.4f}")
-        print(f"F1: {test_metrics['f1']:.4f}")
+        print(f"\nTest Results:")
+        print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
+        print(f"  Precision: {test_metrics['precision']:.4f}")
+        print(f"  Recall:    {test_metrics['recall']:.4f}")
+        print(f"  F1 Score:  {test_metrics['f1']:.4f}")
         
-        # Save final results
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # Save results
         results = {
             'model_type': self.model_type,
-            'best_epoch': best_epoch,
+            'best_epoch': best_epoch + 1,
             'best_val_f1': best_val_f1,
-            'test_metrics': test_metrics
+            'test_metrics': {
+                'accuracy': float(test_metrics['accuracy']),
+                'precision': float(test_metrics['precision']),
+                'recall': float(test_metrics['recall']),
+                'f1': float(test_metrics['f1'])
+            }
         }
         
-        path_ts = f"results_{self.model_type}_{stamp}.json"
-        with open(path_ts, 'w') as f:
+        results_file = f"results_{self.model_type}.json"
+        with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
-        with open(f"results_{self.model_type}.json", 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"[RESULTS] Saved: {os.path.abspath(path_ts)}")
+        
+        print(f"\nResults saved to: {results_file}")
         
         return results
 
