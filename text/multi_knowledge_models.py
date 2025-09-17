@@ -192,6 +192,21 @@ class EnhancedTextEncoder(nn.Module):
         self.importance_scorer = nn.Linear(output_size, 1)
         
     def forward(self, text_input, knowledge_inputs=None, knowledge_masks=None, lam=1):
+        # Ensure inputs are on the same device as the model
+        dev = next(self.bert_model.parameters()).device
+
+        # move text dict to device
+        text_input = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in text_input.items()}
+
+        # move knowledge dicts to device (if any)
+        if knowledge_inputs is not None:
+            ki_moved = []
+            for kd in knowledge_inputs:
+                if kd is None:
+                    ki_moved.append(None)
+                else:
+                    ki_moved.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in kd.items()})
+            knowledge_inputs = ki_moved
         # -------- Text branch --------
         text_output = self.bert_model(**text_input)[0]         # (B, Lt+2, 768)
         text_output = text_output[:, 1:-1, :]                  # remove [CLS], [SEP] -> (B, Lt, 768)
@@ -287,39 +302,7 @@ class WeightedKnowledgeAttention(nn.Module):
             nn.LayerNorm(input_size),
             nn.Dropout(dropout)
         )
-    # def _build_per_type_mask(self, knowledge_masks, knowledge_embeddings):
-    #     # Return a boolean tensor [B, K] where True means "pad/ignore this type".
-    #     B, K, _ = knowledge_embeddings.shape
-    #     device = knowledge_embeddings.device
 
-    #     if knowledge_masks is None:
-    #         return torch.zeros(B, K, dtype=torch.bool, device=device)
-
-    #     if isinstance(knowledge_masks, list):
-    #         per_type = []
-    #         for m in knowledge_masks:
-    #             if m is None:
-    #                 # no tokens for this type -> mask it out
-    #                 per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
-    #             else:
-    #                 # assume m is [B, L_i] with True at PAD positions
-    #                 mb = m.to(device).bool()
-    #                 # if ALL positions are PAD for a sample, this type is effectively absent → mask=True
-    #                 all_pad = mb.all(dim=1, keepdim=True)  # [B,1]
-    #                 per_type.append(all_pad)
-    #         return torch.cat(per_type, dim=1)  # [B, K]
-
-    #     # If someone passes a tensor already, try to coerce to [B, K]
-    #     if torch.is_tensor(knowledge_masks):
-    #         km = knowledge_masks.to(device)
-    #         if km.dim() == 2 and km.size(1) == K:
-    #             return km.bool()
-    #         # Fallback: don't mask
-    #         return torch.zeros(B, K, dtype=torch.bool, device=device)
-
-    #     # Default: no mask
-    #     return torch.zeros(B, K, dtype=torch.bool, device=device)
-        
     def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None):
         """
         Args:

@@ -31,6 +31,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+def _move_tokenizer_batch_to_device(batch_dict, device):
+    if batch_dict is None:
+        return None
+    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch_dict.items()}
+
 class EnhancedTrainer:
     def __init__(self, model_type="baseline", parameter_file="parameter.json"):
         """
@@ -479,6 +484,8 @@ class EnhancedTrainer:
         img_edge_index = self._construct_image_edge_index(batch_size, self.parameter["img_patch"])
         img_edge_index = img_edge_index.to(device)
         
+        texts = _move_tokenizer_batch_to_device(texts, device)
+
         # Handle knowledge data
         knowledge_inputs = None
         knowledge_masks = None
@@ -490,7 +497,8 @@ class EnhancedTrainer:
             # Extract knowledge inputs and masks
             for i in range(9, len(batch), 3):
                 if i < len(batch) and batch[i] is not None:
-                    knowledge_inputs.append(batch[i])
+                    kd = _move_tokenizer_batch_to_device(batch[i], device)  # move dict to device
+                    knowledge_inputs.append(kd)
                     if i+2 < len(batch) and batch[i+2] is not None:
                         knowledge_masks.append(batch[i+2].to(device))
                     else:
@@ -511,6 +519,8 @@ class EnhancedTrainer:
         txt_edge_index = batch[5]
         gnn_mask = batch[6].to(device)
         np_mask = batch[7].to(device)
+
+        texts = _move_tokenizer_batch_to_device(texts, device)
         
         # Handle knowledge data
         knowledge_inputs = []
@@ -519,7 +529,8 @@ class EnhancedTrainer:
         if len(batch) > 9:
             for i in range(9, len(batch), 3):
                 if i < len(batch) and batch[i] is not None:
-                    knowledge_inputs.append(batch[i])
+                    kd = _move_tokenizer_batch_to_device(batch[i], device)
+                    knowledge_inputs.append(kd)
                     if i+2 < len(batch) and batch[i+2] is not None:
                         knowledge_masks.append(batch[i+2].to(device))
                     else:

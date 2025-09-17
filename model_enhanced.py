@@ -87,7 +87,7 @@ class BaselineModel(nn.Module):
         self.txt_encoder = EnhancedTextEncoder(
             input_size=self.txt_input_dim,
             output_size=self.txt_out_size,
-            knowledge_types=[],  # Only captions
+            knowledge_types=[1],  # Only captions
             dropout=self.cro_drop
         )
         
