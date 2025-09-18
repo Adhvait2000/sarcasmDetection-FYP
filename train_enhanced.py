@@ -97,7 +97,7 @@ class EnhancedTrainer:
         self.logger = Logger(f"logs/{model_type}_training")
 
         # Early Stopping parameters
-        self.early_stopping_patience = self.parameter.get("early_stopping_patience", 5)
+        self.early_stopping_patience = self.parameter.get("early_stopping_patience", 3)
         self.early_stop_min_delta = self.parameter.get("early_stop_min_delta", 0.001)
         
     def _initialize_model(self):
