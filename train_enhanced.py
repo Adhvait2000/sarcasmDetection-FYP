@@ -55,8 +55,8 @@ class EnhancedTrainer:
         self.model = self._initialize_model()
         self.model.to(device=device)
         
-        # Setup optimizer with proper learning rates
-        head_lr = self.parameter.get("head_lr", self.parameter["lr"])
+        # # Setup optimizer with proper learning rates
+        # head_lr = self.parameter.get("head_lr", self.parameter["lr"])
         bert_params, new_params = [], []
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
@@ -70,11 +70,11 @@ class EnhancedTrainer:
         if bert_params:
             param_groups.append({"params": bert_params, "lr": self.parameter["lr"]})
         if new_params:
-            # Use head_lr only if specified and for hybrid model
-            group_lr = head_lr if (self.model_type == "hybrid" and "head_lr" in self.parameter) else self.parameter["lr"]
-            param_groups.append({"params": new_params, "lr": group_lr})
+            # Always same LR as BERT (paper-style single LR)
+            param_groups.append({"params": new_params, "lr": self.parameter["lr"]})
         if not param_groups:
             param_groups = [{"params": self.model.parameters(), "lr": self.parameter["lr"]}]
+
         
         self.optimizer = optim.AdamW(
             param_groups,
