@@ -58,7 +58,7 @@ class TriModalFusion(nn.Module):
         )
         
     def forward(self, text_feats, img_feats, know_feats, 
-                text_mask=None, img_mask=None, know_mask=None):
+            text_mask=None, img_mask=None, know_mask=None):
         """
         Args:
             text_feats: [B, Lt, D] 
@@ -86,12 +86,28 @@ class TriModalFusion(nn.Module):
         # Create tri-modal sequence
         tri_modal = torch.cat([text_proj, img_proj, know_proj], dim=1)  # [B, Lt+Li+Lk, D]
         
-        # Create combined attention mask
+        # Create combined attention mask using the actual tensor dimensions
         combined_mask = None
         if any(mask is not None for mask in [text_mask, img_mask, know_mask]):
-            text_m = text_mask if text_mask is not None else torch.zeros(B, text_proj.size(1), device=device, dtype=torch.bool)
-            img_m = img_mask if img_mask is not None else torch.zeros(B, img_proj.size(1), device=device, dtype=torch.bool)
-            know_m = know_mask if know_mask is not None else torch.zeros(B, know_proj.size(1), device=device, dtype=torch.bool)
+            Lt, Li, Lk = text_proj.size(1), img_proj.size(1), know_proj.size(1)
+            
+            # Create masks for each modality, defaulting to False (not masked)
+            if text_mask is not None:
+                text_m = text_mask.to(device).bool()
+            else:
+                text_m = torch.zeros(B, Lt, device=device, dtype=torch.bool)
+                
+            if img_mask is not None:
+                img_m = img_mask.to(device).bool()
+            else:
+                img_m = torch.zeros(B, Li, device=device, dtype=torch.bool)
+                
+            if know_mask is not None:
+                know_m = know_mask.to(device).bool()
+            else:
+                know_m = torch.zeros(B, Lk, device=device, dtype=torch.bool)
+            
+            # Combine masks to match tri_modal sequence length
             combined_mask = torch.cat([text_m, img_m, know_m], dim=1)
         
         # Apply fusion transformer layers
