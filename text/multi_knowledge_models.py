@@ -287,15 +287,15 @@ class KnowledgeGuidedCrossModal(nn.Module):
             # Interleaved combination
             combined = torch.cat([images, texts], dim=1)  # [B, Li+Lt, D]
             
-            # Extend padding mask for combined sequence
+            # FIXED: Extend padding mask for combined sequence
             if key_padding_mask is not None:
-                img_mask = torch.zeros(images.size(0), images.size(1), 
-                                     device=images.device, dtype=torch.bool)
-                combined_mask = torch.cat([img_mask, key_padding_mask], dim=1)
+                Li = images.size(1)
+                img_mask = torch.zeros(images.size(0), Li, 
+                                    device=images.device, dtype=torch.bool)
+                combined_mask = torch.cat([img_mask, key_padding_mask], dim=1)  # [B, Li+Lt]
             else:
                 combined_mask = None
         else:
-            # Other combination strategies can be added here
             combined = torch.cat([images, texts], dim=1)
             combined_mask = key_padding_mask
         
@@ -304,16 +304,14 @@ class KnowledgeGuidedCrossModal(nn.Module):
         for layer in self.cross_modal_layers:
             attended = layer(attended, src_key_padding_mask=combined_mask)
         
-        # Knowledge-guided refinement
+        # Knowledge-guided refinement (if knowledge available)
         if knowledge_context is not None:
-            # Knowledge guides attention over combined features
             knowledge_guided, guidance_attn = self.knowledge_guidance(
                 query=attended,
                 key=knowledge_context,
                 value=knowledge_context
             )
             
-            # Gated combination of original and knowledge-guided features
             gate = self.knowledge_gate(torch.cat([attended, knowledge_guided], dim=-1))
             attended = gate * knowledge_guided + (1 - gate) * attended
         
