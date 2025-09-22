@@ -1,26 +1,557 @@
 """
-Multi-Knowledge Fusion Models
-Implements weighted attention mechanisms for combining captions, ANPs, and attributes
+Enhanced Multi-Knowledge Fusion Models
+Implements sophisticated tri-modal fusion with knowledge-guided attention
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel
 from typing import List, Dict, Tuple, Optional
+import math
 
+class TriModalFusion(nn.Module):
+    """
+    Sophisticated tri-modal fusion replacing naive decision-level concatenation
+    """
+    def __init__(self, hidden_dim=300, num_heads=8, num_layers=3, dropout=0.1):
+        super(TriModalFusion, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        
+        # Three-way cross-attention modules
+        self.text_img_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.text_know_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.img_know_attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Modality-specific projections to ensure consistent dimensions
+        self.text_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.img_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.know_projection = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Fusion transformer layers
+        self.fusion_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=num_heads,
+                dim_feedforward=2 * hidden_dim,
+                dropout=dropout,
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+        
+        # Modality type embeddings
+        self.modality_embeddings = nn.Embedding(3, hidden_dim)  # text, image, knowledge
+        
+        # Output attention pooling
+        self.output_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, text_feats, img_feats, know_feats, 
+                text_mask=None, img_mask=None, know_mask=None):
+        """
+        Args:
+            text_feats: [B, Lt, D] 
+            img_feats: [B, Li, D]
+            know_feats: [B, Lk, D]
+            masks: Optional attention masks for each modality
+        """
+        B = text_feats.size(0)
+        device = text_feats.device
+        
+        # Project to consistent dimensions
+        text_proj = self.text_projection(text_feats)
+        img_proj = self.img_projection(img_feats)
+        know_proj = self.know_projection(know_feats)
+        
+        # Add modality type embeddings
+        text_type = self.modality_embeddings(torch.zeros(B, text_proj.size(1), device=device, dtype=torch.long))
+        img_type = self.modality_embeddings(torch.ones(B, img_proj.size(1), device=device, dtype=torch.long))
+        know_type = self.modality_embeddings(torch.full((B, know_proj.size(1)), 2, device=device, dtype=torch.long))
+        
+        text_proj = text_proj + text_type
+        img_proj = img_proj + img_type
+        know_proj = know_proj + know_type
+        
+        # Create tri-modal sequence
+        tri_modal = torch.cat([text_proj, img_proj, know_proj], dim=1)  # [B, Lt+Li+Lk, D]
+        
+        # Create combined attention mask
+        combined_mask = None
+        if any(mask is not None for mask in [text_mask, img_mask, know_mask]):
+            text_m = text_mask if text_mask is not None else torch.zeros(B, text_proj.size(1), device=device, dtype=torch.bool)
+            img_m = img_mask if img_mask is not None else torch.zeros(B, img_proj.size(1), device=device, dtype=torch.bool)
+            know_m = know_mask if know_mask is not None else torch.zeros(B, know_proj.size(1), device=device, dtype=torch.bool)
+            combined_mask = torch.cat([text_m, img_m, know_m], dim=1)
+        
+        # Apply fusion transformer layers
+        for layer in self.fusion_layers:
+            tri_modal = layer(tri_modal, src_key_padding_mask=combined_mask)
+        
+        # Global attention pooling for final representation
+        pooled, attn_weights = self.output_attn(
+            tri_modal.mean(dim=1, keepdim=True),  # query: global average
+            tri_modal,  # key & value: all tokens
+            tri_modal,
+            key_padding_mask=combined_mask
+        )
+        
+        # Final projection
+        fused_repr = self.output_projection(pooled.squeeze(1))  # [B, D]
+        
+        return fused_repr, attn_weights
+
+class KnowledgeConditionedImageEncoder(nn.Module):
+    """
+    Image encoder that is conditioned by knowledge embeddings
+    """
+    def __init__(self, input_dim=768, inter_dim=500, output_dim=300, 
+                 knowledge_dim=300, num_heads=8, dropout=0.1):
+        super(KnowledgeConditionedImageEncoder, self).__init__()
+        
+        # Base image encoder components
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, inter_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(inter_dim, output_dim)
+        )
+        
+        # Knowledge conditioning modules
+        self.know_to_patch_attn = nn.MultiheadAttention(
+            output_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        
+        # Patch importance scoring with knowledge conditioning
+        self.patch_scorer = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim),  # concat original + conditioned
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim, 1)
+        )
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(output_dim)
+        
+    def forward(self, imgs, knowledge_embeddings=None, lam=1):
+        """
+        Args:
+            imgs: [B, K_patches, input_dim]
+            knowledge_embeddings: [B, K_types, knowledge_dim] or None
+        """
+        # Standard image feature extraction
+        img_features = self.feature_extractor(imgs)  # [B, K_patches, output_dim]
+        
+        if knowledge_embeddings is not None:
+            # Knowledge-conditioned patch features
+            conditioned_features, knowledge_attn = self.know_to_patch_attn(
+                query=img_features,
+                key=knowledge_embeddings,
+                value=knowledge_embeddings
+            )
+            
+            # Combine original and conditioned features
+            combined_features = torch.cat([img_features, conditioned_features], dim=-1)
+            
+            # Compute knowledge-aware patch importance
+            patch_scores = self.patch_scorer(combined_features).squeeze(-1)  # [B, K_patches]
+            
+            # Apply layer norm to conditioned features
+            final_features = self.layer_norm(conditioned_features)
+        else:
+            # Fallback to standard processing
+            combined_features = torch.cat([img_features, img_features], dim=-1)
+            patch_scores = self.patch_scorer(combined_features).squeeze(-1)
+            final_features = self.layer_norm(img_features)
+        
+        # Safe softmax for patch importance
+        patch_scores = patch_scores * lam
+        patch_weights = F.softmax(patch_scores, dim=-1)
+        patch_weights = torch.nan_to_num(patch_weights, nan=0.0)
+        
+        # Ensure weights sum to 1
+        weight_sums = patch_weights.sum(dim=-1, keepdim=True)
+        patch_weights = torch.where(
+            weight_sums == 0,
+            torch.full_like(patch_weights, 1.0 / patch_weights.size(-1)),
+            patch_weights / weight_sums
+        )
+        
+        return final_features, patch_weights
+
+class CrossTypeKnowledgePooling(nn.Module):
+    def __init__(self, hidden_dim=300, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, type_vecs: torch.Tensor, type_scores: Optional[torch.Tensor] = None):
+        """
+        Args:
+            type_vecs: [B, K, D]  per-type knowledge vectors (e.g., caption / ANP / attribute)
+            type_scores: Optional [B, K] weights per type.
+        Returns:
+            pooled:  [B, D]   (weighted or mean-pooled across K)
+            refined: [B, K, D] (cross-type self-attended)
+        """
+        if type_vecs is None or type_vecs.size(1) == 0:
+            B = 1 if type_vecs is None else type_vecs.size(0)
+            D = 300 if type_vecs is None else type_vecs.size(-1)
+            device = None if type_vecs is None else type_vecs.device
+            return (torch.zeros(B, D, device=device), torch.zeros(B, 0, D, device=device))
+
+        # Cross-type self-attention over K types
+        refined, _ = self.mha(type_vecs, type_vecs, type_vecs)      # [B, K, D]
+        refined = self.norm(refined + type_vecs)                     # residual
+
+        if type_scores is not None:
+            w = F.softmax(type_scores, dim=-1).unsqueeze(-1)         # [B, K, 1]
+            pooled = (w * refined).sum(dim=1)                        # [B, D]
+        else:
+            pooled = refined.mean(dim=1)                             # [B, D]
+
+        return pooled, refined
+class KnowledgeGuidedCrossModal(nn.Module):
+    """
+    Cross-modal interaction guided by knowledge context
+    """
+    def __init__(self, input_size=300, nhead=8, dim_feedforward=600, 
+                 dropout=0.1, cro_layer=6, type_bmco=1):
+        super(KnowledgeGuidedCrossModal, self).__init__()
+        
+        self.input_size = input_size
+        self.nhead = nhead
+        self.type_bmco = type_bmco
+        
+        # Base cross-modal transformer layers
+        self.cross_modal_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=input_size,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True
+            ) for _ in range(cro_layer)
+        ])
+        
+        # Knowledge guidance modules
+        self.knowledge_guidance = nn.MultiheadAttention(
+            input_size, nhead, dropout=dropout, batch_first=True
+        )
+        
+        self.knowledge_gate = nn.Sequential(
+            nn.Linear(input_size * 2, input_size),
+            nn.Sigmoid()
+        )
+        
+        # Modality-specific adaptation
+        self.image_adapter = nn.Linear(input_size, input_size)
+        self.text_adapter = nn.Linear(input_size, input_size)
+        
+    def forward(self, images, texts, knowledge_context=None, key_padding_mask=None):
+        """
+        Args:
+            images: [B, Li, D]
+            texts: [B, Lt, D] 
+            knowledge_context: [B, Lk, D] or None
+            key_padding_mask: [B, Lt] for text padding
+        """
+        # Combine image and text for cross-modal processing
+        if self.type_bmco == 1:
+            # Interleaved combination
+            combined = torch.cat([images, texts], dim=1)  # [B, Li+Lt, D]
+            
+            # Extend padding mask for combined sequence
+            if key_padding_mask is not None:
+                img_mask = torch.zeros(images.size(0), images.size(1), 
+                                     device=images.device, dtype=torch.bool)
+                combined_mask = torch.cat([img_mask, key_padding_mask], dim=1)
+            else:
+                combined_mask = None
+        else:
+            # Other combination strategies can be added here
+            combined = torch.cat([images, texts], dim=1)
+            combined_mask = key_padding_mask
+        
+        # Apply cross-modal transformer layers
+        attended = combined
+        for layer in self.cross_modal_layers:
+            attended = layer(attended, src_key_padding_mask=combined_mask)
+        
+        # Knowledge-guided refinement
+        if knowledge_context is not None:
+            # Knowledge guides attention over combined features
+            knowledge_guided, guidance_attn = self.knowledge_guidance(
+                query=attended,
+                key=knowledge_context,
+                value=knowledge_context
+            )
+            
+            # Gated combination of original and knowledge-guided features
+            gate = self.knowledge_gate(torch.cat([attended, knowledge_guided], dim=-1))
+            attended = gate * knowledge_guided + (1 - gate) * attended
+        
+        # Split back into image and text components
+        Li, Lt = images.size(1), texts.size(1)
+        attended_images = self.image_adapter(attended[:, :Li, :])
+        attended_texts = self.text_adapter(attended[:, Li:Li+Lt, :])
+        
+        return attended_images, attended_texts
+
+class EnhancedHybridModel(nn.Module):
+    """
+    Sophisticated hybrid model with tri-modal fusion and knowledge conditioning
+    """
+    def __init__(self, txt_input_dim=768, txt_out_size=300, img_input_dim=768,
+                 img_inter_dim=500, img_out_dim=300, knowledge_types=[1, 2, 3],
+                 max_knowledge_length=20, cro_layers=6, cro_heads=5, cro_drop=0.5,
+                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, img_gat_layer=2,
+                 img_gat_drop=0.5, img_gat_head=2, img_patch=49, lam=1, type_bmco=1):
+        super(EnhancedHybridModel, self).__init__()
+        
+        # Store parameters
+        self.txt_input_dim = txt_input_dim
+        self.txt_out_size = txt_out_size
+        self.img_out_dim = img_out_dim
+        self.knowledge_types = knowledge_types
+        self.lam = lam
+        
+        # Ensure dimensions match
+        if self.img_out_dim != self.txt_out_size:
+            self.img_out_dim = self.txt_out_size
+        
+        # Enhanced text encoder with specialized BERT
+        self.txt_encoder = EnhancedTextEncoder(
+            input_size=self.txt_input_dim,
+            output_size=self.txt_out_size,
+            knowledge_types=self.knowledge_types,
+            max_knowledge_length=max_knowledge_length,
+            dropout=cro_drop
+        )
+        
+        # Knowledge-conditioned image encoder
+        self.img_encoder = KnowledgeConditionedImageEncoder(
+            input_dim=img_input_dim,
+            inter_dim=img_inter_dim,
+            output_dim=self.img_out_dim,
+            knowledge_dim=self.txt_out_size,
+            dropout=cro_drop
+        )
+        
+        # Cross-type knowledge pooling (expects per-type vectors [B, K, D])
+        self.knowledge_pooling = CrossTypeKnowledgePooling(
+            hidden_dim=self.txt_out_size,
+            dropout=cro_drop
+        )
+        
+        # Knowledge-guided cross-modal interaction
+        self.cross_modal_interaction = KnowledgeGuidedCrossModal(
+            input_size=self.img_out_dim,
+            nhead=cro_heads,
+            dim_feedforward=2 * self.img_out_dim,
+            dropout=cro_drop,
+            cro_layer=cro_layers,
+            type_bmco=type_bmco
+        )
+        
+        # Tri-modal fusion replacing naive concatenation
+        self.tri_modal_fusion = TriModalFusion(
+            hidden_dim=self.txt_out_size,
+            num_heads=cro_heads,
+            dropout=cro_drop
+        )
+        
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(self.txt_out_size, self.txt_out_size // 2),
+            nn.ReLU(),
+            nn.Dropout(cro_drop),
+            nn.Linear(self.txt_out_size // 2, 2)
+        )
+        
+    def forward(self, imgs, texts, mask_batch, img_edge_index, t1_word_seq,
+                txt_edge_index, gnn_mask, np_mask, knowledge_inputs, knowledge_masks):
+        """
+        Enhanced forward pass with sophisticated tri-modal fusion
+        """
+        # 1) Encode text and per-type knowledge vectors
+        texts_encoded, text_scores, knowledge_embeddings, knowledge_scores = self.txt_encoder(
+            text_input=texts,
+            knowledge_inputs=knowledge_inputs,
+            knowledge_masks=knowledge_masks,
+            lam=self.lam
+        )
+        # texts_encoded:        [B, Lt, D]
+        # knowledge_embeddings: [B, K, D]  (per-type)
+        # knowledge_scores:     [B, K]
+
+        # 2) Cross-type knowledge pooling
+        if knowledge_embeddings is not None:
+            # pooled_knowledge_vec: [B, D]  (single vector)
+            # refined_knowledge:    [B, K, D] (per-type refined)
+            pooled_knowledge_vec, refined_knowledge = self.knowledge_pooling(
+                knowledge_embeddings, knowledge_scores
+            )
+        else:
+            pooled_knowledge_vec, refined_knowledge = None, None
+
+        # 3) Knowledge-conditioned image encoding uses the refined per-type matrix
+        imgs_encoded, patch_weights = self.img_encoder(
+            imgs, knowledge_embeddings=refined_knowledge, lam=self.lam
+        )
+        # imgs_encoded: [B, Li, D], patch_weights: [B, Li]
+
+        # 4) Knowledge-guided cross-modal interaction
+        knowledge_context = refined_knowledge  # [B, K, D] or None
+        imgs_attended, texts_attended = self.cross_modal_interaction(
+            images=imgs_encoded,
+            texts=texts_encoded,
+            knowledge_context=knowledge_context,
+            key_padding_mask=mask_batch
+        )
+        # imgs_attended:  [B, Li, D]
+        # texts_attended: [B, Lt, D]
+
+        # 5) Prepare single-token summaries per modality for fusion
+        text_global = texts_attended.mean(dim=1, keepdim=True)   # [B, 1, D]
+        img_global  = imgs_attended.mean(dim=1, keepdim=True)    # [B, 1, D]
+        if pooled_knowledge_vec is not None:
+            know_global = pooled_knowledge_vec.unsqueeze(1)      # [B, 1, D]
+        else:
+            # If no knowledge available, use a zero token as placeholder
+            know_global = torch.zeros_like(text_global)
+
+        # 6) Tri-modal fusion (sequence of three tokens: T=1, I=1, K=1)
+        fused_representation, _ = self.tri_modal_fusion(
+            text_feats=text_global,
+            img_feats=img_global,
+            know_feats=know_global
+        )  # [B, D]
+
+        # 7) Final classification
+        predictions = self.classifier(fused_representation)       # [B, 2]
+        return predictions
+
+
+# Update the existing EnhancedTextEncoder to support specialized BERT
+class EnhancedTextEncoder(nn.Module):
+    def __init__(self, input_size=768, output_size=300, knowledge_types=[1, 2, 3],
+                 max_knowledge_length=20, dropout=0.1, use_specialized_bert=False):
+        super(EnhancedTextEncoder, self).__init__()
+        
+        self.input_size = input_size
+        self.output_size = output_size
+        self.knowledge_types = knowledge_types
+        self.max_knowledge_length = max_knowledge_length
+        
+        # Main BERT for text
+        self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+        
+        # Optional specialized BERT for knowledge (can be same as main)
+        if use_specialized_bert:
+            self.knowledge_bert = BertModel.from_pretrained('bert-base-uncased')
+        else:
+            self.knowledge_bert = self.bert_model
+        
+        # Knowledge fusion module (existing)
+        self.knowledge_fusion = MultiKnowledgeFusion(
+            input_size=input_size,
+            output_size=output_size,
+            num_knowledge_types=len(knowledge_types),
+            dropout=dropout
+        )
+        
+        # Text projection
+        self.text_projection = nn.Sequential(
+            nn.Linear(input_size, output_size),
+            nn.LayerNorm(output_size),
+            nn.Dropout(dropout)
+        )
+        
+        # Knowledge projection
+        self.knowledge_projection = nn.Sequential(
+            nn.Linear(output_size, output_size),
+            nn.LayerNorm(output_size),
+            nn.Dropout(dropout)
+        )
+        
+        # Importance scoring
+        self.importance_scorer = nn.Linear(output_size, 1)
+        
+    def forward(self, text_input, knowledge_inputs=None, knowledge_masks=None, lam=1):
+        # Move inputs to device
+        dev = next(self.bert_model.parameters()).device
+        text_input = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in text_input.items()}
+        
+        if knowledge_inputs is not None:
+            ki_moved = []
+            for kd in knowledge_inputs:
+                if kd is None:
+                    ki_moved.append(None)
+                else:
+                    ki_moved.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in kd.items()})
+            knowledge_inputs = ki_moved
+        
+        # Text encoding
+        text_output = self.bert_model(**text_input)[0]
+        text_output = text_output[:, 1:-1, :]  # Remove [CLS], [SEP]
+        text_embeddings = self.text_projection(text_output)
+        
+        # Text importance scoring with safe softmax
+        text_scores = self.importance_scorer(text_embeddings).squeeze(-1)
+        logits = text_scores * lam
+        probs = F.softmax(logits, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0)
+        row_sums = probs.sum(dim=-1, keepdim=True)
+        text_scores = torch.where(row_sums == 0, 
+                                torch.full_like(probs, 1.0 / probs.size(-1)), 
+                                probs)
+        
+        # Knowledge encoding
+        knowledge_embeddings = None
+        knowledge_scores = None
+        
+        if knowledge_inputs is not None:
+            knowledge_list = []
+            for knowledge_input in knowledge_inputs:
+                if knowledge_input is not None:
+                    k_out = self.knowledge_bert(**knowledge_input)[0]
+                    k_out = k_out[:, 1:-1, :]  # Remove [CLS], [SEP]
+                    knowledge_list.append(k_out)
+                else:
+                    dummy = torch.zeros(text_output.size(0), 1, self.input_size, 
+                                      device=text_output.device, dtype=text_output.dtype)
+                    knowledge_list.append(dummy)
+            
+            # Fuse knowledge
+            fused_knowledge, knowledge_weights = self.knowledge_fusion(knowledge_list, knowledge_masks)
+            knowledge_embeddings_proj = self.knowledge_projection(fused_knowledge)
+            
+            # Per-type pooling using knowledge weights
+            eps = 1e-8
+            type_embeddings = torch.einsum('bld,blk->bkd', knowledge_embeddings_proj, knowledge_weights)
+            denom = knowledge_weights.sum(dim=1, keepdim=False).unsqueeze(-1) + eps
+            knowledge_embeddings = type_embeddings / denom
+            
+            knowledge_scores = self.importance_scorer(knowledge_embeddings).squeeze(-1)
+            knowledge_scores = F.softmax(knowledge_scores * lam, dim=-1)
+        
+        return text_embeddings, text_scores, knowledge_embeddings, knowledge_scores
+
+# Keep existing MultiKnowledgeFusion class unchanged
 class MultiKnowledgeFusion(nn.Module):
     def __init__(self, input_size=768, output_size=300, num_knowledge_types=3, 
                  attention_heads=8, dropout=0.1):
-        """
-        Multi-knowledge fusion module with weighted attention
-        
-        Args:
-            input_size: Input dimension size
-            output_size: Output dimension size
-            num_knowledge_types: Number of knowledge types (caption, ANP, attribute)
-            attention_heads: Number of attention heads
-            dropout: Dropout rate
-        """
         super(MultiKnowledgeFusion, self).__init__()
         
         self.input_size = input_size
@@ -65,17 +596,6 @@ class MultiKnowledgeFusion(nn.Module):
         
     def forward(self, knowledge_embeddings: List[torch.Tensor], 
                 knowledge_masks: List[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass for multi-knowledge fusion
-        
-        Args:
-            knowledge_embeddings: List of knowledge embeddings [caption, anp, attribute]
-            knowledge_masks: List of knowledge masks (optional)
-            
-        Returns:
-            fused_knowledge: Fused knowledge representation
-            knowledge_weights: Knowledge type importance weights
-        """
         batch_size = knowledge_embeddings[0].size(0)
         max_length = max(emb.size(1) for emb in knowledge_embeddings)
         
@@ -100,7 +620,7 @@ class MultiKnowledgeFusion(nn.Module):
             type_enhanced_embeddings.append(enhanced_emb)
         
         # Concatenate all knowledge types
-        all_knowledge = torch.cat(type_enhanced_embeddings, dim=1)  # (B, L*K, D)
+        all_knowledge = torch.cat(type_enhanced_embeddings, dim=1)
         
         # Apply self-attention across all knowledge
         attended_knowledge, attention_weights = self.knowledge_attention(
@@ -117,17 +637,17 @@ class MultiKnowledgeFusion(nn.Module):
             scores = self.knowledge_scorer(attended_knowledge[:, :, i, :])
             knowledge_scores.append(scores)
         
-        knowledge_scores = torch.cat(knowledge_scores, dim=-1)  # (B, L, K)
+        knowledge_scores = torch.cat(knowledge_scores, dim=-1)
         
         # Apply knowledge gate
         knowledge_weights = self.knowledge_gate(
             attended_knowledge.reshape(batch_size, max_length, -1)
-        )  # (B, L, K)
+        )
         
         # Weighted combination
         weighted_knowledge = torch.sum(
             attended_knowledge * knowledge_weights.unsqueeze(-1), dim=2
-        )  # (B, L, D)
+        )
         
         # Project to output size
         fused_knowledge = self.output_projection(
@@ -135,260 +655,3 @@ class MultiKnowledgeFusion(nn.Module):
         )
         
         return fused_knowledge, knowledge_weights
-
-class EnhancedTextEncoder(nn.Module):
-    def __init__(self, input_size=768, output_size=300, knowledge_types=[1, 2, 3],
-                 max_knowledge_length=20, dropout=0.1):
-        """
-        Enhanced text encoder with multi-knowledge support
-        
-        Args:
-            input_size: Input dimension size
-            output_size: Output dimension size
-            knowledge_types: List of knowledge types to use
-            max_knowledge_length: Maximum length for knowledge sequences
-            dropout: Dropout rate
-        """
-        super(EnhancedTextEncoder, self).__init__()
-        
-        self.input_size = input_size
-        self.output_size = output_size
-        self.knowledge_types = knowledge_types
-        self.max_knowledge_length = max_knowledge_length
-        
-        # BERT model for text encoding
-        self.bert_model = BertModel.from_pretrained('bert-base-uncased')
-        
-        # Knowledge fusion module
-        self.knowledge_fusion = MultiKnowledgeFusion(
-            input_size=input_size,
-            output_size=output_size,
-            num_knowledge_types=len(knowledge_types),
-            dropout=dropout
-        )
-        
-        # Text projection
-        self.text_projection = nn.Sequential(
-            nn.Linear(input_size, output_size),
-            nn.LayerNorm(output_size),
-            nn.Dropout(dropout)
-        )
-        
-        # Knowledge projection
-        self.knowledge_projection = nn.Sequential(
-            nn.Linear(output_size, output_size),
-            nn.LayerNorm(output_size),
-            nn.Dropout(dropout)
-        )
-        
-        # Final fusion layer
-        self.final_fusion = nn.Sequential(
-            nn.Linear(output_size * 2, output_size),
-            nn.LayerNorm(output_size),
-            nn.Dropout(dropout)
-        )
-        
-        # Importance scoring
-        self.importance_scorer = nn.Linear(output_size, 1)
-        
-    def forward(self, text_input, knowledge_inputs=None, knowledge_masks=None, lam=1):
-        # Ensure inputs are on the same device as the model
-        dev = next(self.bert_model.parameters()).device
-
-        # move text dict to device
-        text_input = {k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in text_input.items()}
-
-        # move knowledge dicts to device (if any)
-        if knowledge_inputs is not None:
-            ki_moved = []
-            for kd in knowledge_inputs:
-                if kd is None:
-                    ki_moved.append(None)
-                else:
-                    ki_moved.append({k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in kd.items()})
-            knowledge_inputs = ki_moved
-        # -------- Text branch --------
-        text_output = self.bert_model(**text_input)[0]         # (B, Lt+2, 768)
-        text_output = text_output[:, 1:-1, :]                  # remove [CLS], [SEP] -> (B, Lt, 768)
-
-        text_embeddings = self.text_projection(text_output)    # (B, Lt, D)
-
-        text_scores = self.importance_scorer(text_embeddings).squeeze(-1)  # (B, Lt)
-
-        # NEW: safe softmax
-        logits = text_scores * lam
-        probs = F.softmax(logits, dim=-1)
-        probs = torch.nan_to_num(probs, nan=0.0)  # replace NaN with 0
-        row_sums = probs.sum(dim=-1, keepdim=True)
-        probs = torch.where(row_sums == 0, torch.full_like(probs, 1.0 / probs.size(-1)), probs)
-
-        text_scores = probs
-
-
-        # -------- Knowledge branch --------
-        knowledge_embeddings = None
-        knowledge_scores = None
-
-        if knowledge_inputs is not None:
-            # Encode each knowledge type with the same BERT
-            knowledge_list = []
-            for knowledge_input in knowledge_inputs:
-                if knowledge_input is not None:
-                    k_out = self.bert_model(**knowledge_input)[0]   # (B, Lk+2, 768)
-                    k_out = k_out[:, 1:-1, :]                       # (B, Lk, 768)
-                    knowledge_list.append(k_out)
-                else:
-                    # Fallback: zero-length => create a single zero token then pad later
-                    # To keep shapes simple, create a (B, 1, 768) zero tensor
-                    dummy = torch.zeros(text_output.size(0), 1, self.input_size, device=text_output.device, dtype=text_output.dtype)
-                    knowledge_list.append(dummy)
-
-            # Fuse across all knowledge tokens to get contextualized per-token knowledge reprs (B, L, 768)
-            fused_knowledge, knowledge_weights = self.knowledge_fusion(knowledge_list, knowledge_masks)
-            # fused_knowledge: (B, L, 768) ; knowledge_weights: (B, L, K)
-
-            # --- Option A pooling: turn (B, L, D) + (B, L, K) -> (B, K, D) ---
-            # First project fused tokens to D (to match downstream attention dimension)
-            fused_knowledge_proj = self.knowledge_projection(fused_knowledge)  # (B, L, D)
-
-            # Weighted average per knowledge type over sequence length
-            # type_embeddings[b,k,d] = sum_l fused_knowledge_proj[b,l,d] * weights[b,l,k] / sum_l weights[b,l,k]
-            eps = 1e-8
-            # einsum: (B,L,D) x (B,L,K) -> (B,K,D)
-            type_embeddings = torch.einsum('bld,blk->bkd', fused_knowledge_proj, knowledge_weights)
-            denom = knowledge_weights.sum(dim=1, keepdim=False).unsqueeze(-1) + eps  # (B, K, 1)
-            type_embeddings = type_embeddings / denom                                # (B, K, D)
-
-            # Per-type scores (optional; useful for diagnostics or further gating)
-            knowledge_embeddings = type_embeddings                                    # (B, K, D)
-            knowledge_scores = self.importance_scorer(knowledge_embeddings).squeeze(-1)  # (B, K)
-            knowledge_scores = F.softmax(knowledge_scores * lam, dim=-1)
-
-        return text_embeddings, text_scores, knowledge_embeddings, knowledge_scores
-
-
-class WeightedKnowledgeAttention(nn.Module):
-    def __init__(self, input_size=768, num_heads=8, dropout=0.1, num_knowledge_types=3):
-        """
-        Weighted attention mechanism for knowledge integration
-        
-        Args:
-            input_size: Input dimension size
-            num_heads: Number of attention heads
-            dropout: Dropout rate
-            num_knowledge_types: Number of knowledge types to handle
-        """
-        super(WeightedKnowledgeAttention, self).__init__()
-        
-        self.input_size = input_size
-        self.num_heads = num_heads
-        self.num_knowledge_types = num_knowledge_types
-        
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=input_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Knowledge type weighting
-        self.knowledge_weights = nn.Parameter(torch.ones(num_knowledge_types))
-        self.knowledge_softmax = nn.Softmax(dim=0)
-        
-        # Output projection
-        self.output_projection = nn.Sequential(
-            nn.Linear(input_size, input_size),
-            nn.LayerNorm(input_size),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None):
-        """
-        Args:
-            text_embeddings: Tensor of shape [B, L, D]
-            knowledge_embeddings: Tensor of shape [B, K, D]  (one vector per knowledge type)
-            knowledge_masks: Optional list/tensor of masks. If a list, each element is a
-                            per-token mask for a knowledge type shaped [B, L_i] with True at PADs.
-                            We'll collapse it to a per-type mask [B, K] for MultiheadAttention.
-        Returns:
-            attended_text:       [B, L, D]
-            attended_knowledge:  [B, K, D]
-            text_attention:      attention weights from the text<-knowledge attention
-        """
-        B, L, D = text_embeddings.shape
-        Bk, K, Dk = knowledge_embeddings.shape
-        assert B == Bk and D == Dk, "Batch or embedding dims mismatch between text and knowledge."
-
-        device = knowledge_embeddings.device
-
-        # Compute (learned) knowledge-type weights and reweight knowledge embeddings
-        knowledge_type_weights = self.knowledge_softmax(self.knowledge_weights)             # [K]
-        weighted_knowledge = knowledge_embeddings * knowledge_type_weights.view(1, K, 1)   # [B, K, D]
-
-        # --- Build a proper key_padding_mask for keys of length K: [B, K] boolean ---
-        # True means "ignore/pad" per PyTorch's MultiheadAttention.
-        def _build_per_type_mask(k_masks, K_expected):
-            if k_masks is None:
-                return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
-
-            # If a list: each element is a per-token mask [B, L_i] for that type.
-            if isinstance(k_masks, list):
-                per_type = []
-                for m in k_masks:
-                    if m is None:
-                        # No tokens available for this type -> mask it out
-                        per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
-                    else:
-                        mb = m.to(device)
-                        if mb.dim() == 3 and mb.size(-1) == 1:
-                            mb = mb.squeeze(-1)  # [B, L_i]
-                        mb = mb.bool()
-                        # If ALL positions are PAD for a sample, this type is absent -> mask=True
-                        all_pad = mb.all(dim=1, keepdim=True)  # [B, 1]
-                        per_type.append(all_pad)
-                kp = torch.cat(per_type, dim=1)  # [B, K_list]
-                # Pad/crop to expected K if needed
-                if kp.size(1) < K_expected:
-                    pad = torch.zeros(B, K_expected - kp.size(1), dtype=torch.bool, device=device)
-                    kp = torch.cat([kp, pad], dim=1)
-                elif kp.size(1) > K_expected:
-                    kp = kp[:, :K_expected]
-                return kp
-
-            # If already a tensor, try to coerce to [B, K]
-            if torch.is_tensor(k_masks):
-                km = k_masks.to(device)
-                if km.dim() == 2 and km.size(0) == B and km.size(1) == K_expected:
-                    return km.bool()
-                # Fallback: no mask if shape is not compatible
-                return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
-
-            # Default: no mask
-            return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
-
-        kp_mask = _build_per_type_mask(knowledge_masks, K)  # [B, K], True=ignore
-        kp_mask = kp_mask.to(weighted_knowledge.device).bool()
-
-        all_masked = kp_mask.all(dim=1)  # [B]
-        if all_masked.any():
-            fix_idx = all_masked.nonzero(as_tuple=False).squeeze(-1)
-            kp_mask[fix_idx, 0] = False
-
-        # Cross-attention: text attends to knowledge (keys/values length = K)
-        attended_text, text_attention = self.attention(
-            query=text_embeddings, key=weighted_knowledge, value=weighted_knowledge, key_padding_mask=kp_mask
-        )
-        attended_text = torch.nan_to_num(attended_text, 0.0)              # NEW: nan guard
-        attended_text = torch.clamp(attended_text, -1e4, 1e4)             # NEW: clamp extremes
-        attended_text = self.output_projection(attended_text)              # NEW: actually use projection
-
-        # Reverse attention: knowledge attends to text
-        attended_knowledge, _ = self.attention(
-            query=weighted_knowledge, key=text_embeddings, value=text_embeddings
-        )
-        attended_knowledge = torch.nan_to_num(attended_knowledge, 0.0)    # NEW: nan guard
-        attended_knowledge = torch.clamp(attended_knowledge, -1e4, 1e4)   # NEW: clamp extremes
-        attended_knowledge = self.output_projection(attended_knowledge)    # NEW: use projection
-
-        return attended_text, attended_knowledge, text_attention
