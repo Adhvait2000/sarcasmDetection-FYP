@@ -513,7 +513,7 @@ class EnhancedTrainer:
                 total_loss += loss.item()
                 
                 # Store predictions and confidence scores
-                probabilities = F.softmax(outputs, dim=1)
+                probabilities = torch.softmax(outputs, dim=1)
                 confidences = torch.max(probabilities, dim=1)[0]
                 _, predicted = torch.max(outputs.data, 1)
                 
