@@ -467,16 +467,22 @@ class EnhancedTextEncoder(nn.Module):
         
         # Main BERT for text
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
-        self.knowledge_bert = self.bert_model
+        self.knowledge_bert = self.bert_model  # share weights
 
-        # Freeze everything
+        # 1) Freeze everything
         for p in self.bert_model.parameters():
             p.requires_grad = False
 
-        # Unfreeze only the last 2 layers + pooler/LayerNorm
+        # 2) Unfreeze only the last 4 layers + pooler/LayerNorm
+        TRAINABLE_KEYS = [
+            "encoder.layer.8", "encoder.layer.9",
+            "encoder.layer.10", "encoder.layer.11",
+            "pooler", "LayerNorm"
+        ]
         for name, p in self.bert_model.named_parameters():
-            if any(k in name for k in ["encoder.layer.10", "encoder.layer.11", "pooler", "LayerNorm"]):
+            if any(k in name for k in TRAINABLE_KEYS):
                 p.requires_grad = True
+
         
        
         # Knowledge fusion module (existing)
