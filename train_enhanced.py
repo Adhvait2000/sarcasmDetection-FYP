@@ -327,11 +327,11 @@ class EnhancedTrainer:
                 print(f"  Images: {batch[0].shape if len(batch) > 0 else 'None'}")
                 print(f"  Batch length: {len(batch)}")
             
-            # Unpack batch data based on model type
-            if self.model_type == "knowledge_only":
+            # Unpack batch data based on the actual model class (robust)
+            if isinstance(self.model, EnhancedKnowledgeOnlyModel):
                 texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                 knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
-                
+
                 outputs = self.model(
                     texts=texts,
                     mask_batch=mask_batch,
@@ -342,19 +342,21 @@ class EnhancedTrainer:
                     knowledge_inputs=knowledge_inputs,
                     knowledge_masks=knowledge_masks
                 )
+
             elif self.model_type == "image_only":
                 imgs = batch[0].to(device)
                 outputs = self.model(imgs=imgs)
+
             else:
                 # Baseline, text_image, and hybrid models
                 imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                 gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
-                
+
                 # Debug shapes for first batch
                 if batch_idx == 0:
                     print(f"  Prepared imgs: {imgs.shape}")
                     print(f"  img_edge_index: {img_edge_index.shape}")
-                
+
                 outputs = self.model(
                     imgs=imgs,
                     texts=texts,
@@ -406,11 +408,11 @@ class EnhancedTrainer:
         
         with torch.no_grad():
             for batch in tqdm(data_loader, desc=f"Evaluating {split}"):
-                # Prepare batch based on model type
-                if self.model_type == "knowledge_only":
+                # Prepare batch based on the actual model class (robust)
+                if isinstance(self.model, EnhancedKnowledgeOnlyModel):
                     texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                     knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
-                    
+
                     outputs = self.model(
                         texts=texts,
                         mask_batch=mask_batch,
@@ -421,13 +423,15 @@ class EnhancedTrainer:
                         knowledge_inputs=knowledge_inputs,
                         knowledge_masks=knowledge_masks
                     )
+
                 elif self.model_type == "image_only":
                     imgs = batch[0].to(device)
                     outputs = self.model(imgs=imgs)
+
                 else:
                     imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
-                    
+
                     outputs = self.model(
                         imgs=imgs,
                         texts=texts,
