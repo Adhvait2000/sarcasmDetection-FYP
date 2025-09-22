@@ -475,8 +475,9 @@ class EnhancedTextEncoder(nn.Module):
 
         # 2) Unfreeze only the last 4 layers + pooler/LayerNorm
         TRAINABLE_KEYS = [
-            "encoder.layer.8", "encoder.layer.9",
-            "encoder.layer.10", "encoder.layer.11",
+            "encoder.layer.6", "encoder.layer.7", 
+            "encoder.layer.8", "encoder.layer.9", 
+            "encoder.layer.10","encoder.layer.11",
             "pooler", "LayerNorm"
         ]
         for name, p in self.bert_model.named_parameters():
