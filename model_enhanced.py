@@ -392,11 +392,11 @@ class SuperiorHybridModel(nn.Module):
         # Tri-modal fusion replacing naive decision concatenation (addresses bottleneck #1)
         self.tri_modal_fusion = TriModalFusion(
             hidden_dim=self.txt_out_size,
-            num_heads=cro_heads,
-            num_layers=4,  # Deeper fusion for hybrid model
+            num_heads=min(cro_heads, 6),  # Cap heads
+            num_layers=2,  # Reduced from 4 to 2
             dropout=cro_drop
-        )
-        
+        )   
+                
         # Confidence-based weighting
         self.confidence_estimator = nn.Sequential(
             nn.Linear(self.txt_out_size, self.txt_out_size // 2),

@@ -39,11 +39,11 @@ class TriModalFusion(nn.Module):
         self.fusion_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=2 * hidden_dim,
+                nhead=min(num_heads, 6),  # Cap at 6 heads
+                dim_feedforward=int(1.5 * hidden_dim),  # Reduced from 2x to 1.5x
                 dropout=dropout,
                 batch_first=True
-            ) for _ in range(num_layers)
+            ) for _ in range(min(num_layers, 2))  # Cap at 2 layers
         ])
         
         # Modality type embeddings
@@ -150,10 +150,10 @@ class KnowledgeConditionedImageEncoder(nn.Module):
         
         # Patch importance scoring with knowledge conditioning
         self.patch_scorer = nn.Sequential(
-            nn.Linear(output_dim * 2, output_dim),  # concat original + conditioned
+            nn.Linear(output_dim * 2, output_dim // 2),  # Bottleneck
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(output_dim, 1)
+            nn.Linear(output_dim // 2, 1)
         )
         
         # Layer normalization
@@ -467,13 +467,9 @@ class EnhancedTextEncoder(nn.Module):
         
         # Main BERT for text
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+        self.knowledge_bert = self.bert_model
         
-        # Optional specialized BERT for knowledge (can be same as main)
-        if use_specialized_bert:
-            self.knowledge_bert = BertModel.from_pretrained('bert-base-uncased')
-        else:
-            self.knowledge_bert = self.bert_model
-        
+       
         # Knowledge fusion module (existing)
         self.knowledge_fusion = MultiKnowledgeFusion(
             input_size=input_size,
