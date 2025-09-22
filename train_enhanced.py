@@ -68,8 +68,7 @@ class EnhancedTrainer:
             self.optimizer,
             mode='min',
             factor=0.1,
-            patience=self.parameter.get("patience", 3),
-            verbose=True
+            patience=self.parameter.get("patience", 3)
         )
         
         self.criterion = CrossEntropyLoss()
