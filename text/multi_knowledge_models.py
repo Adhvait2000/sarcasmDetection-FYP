@@ -276,51 +276,48 @@ class KnowledgeGuidedCrossModal(nn.Module):
         
     def forward(self, images, texts, knowledge_context=None, key_padding_mask=None):
         """
-        Args:
-            images: [B, Li, D]
-            texts: [B, Lt, D] 
-            knowledge_context: [B, Lk, D] or None
-            key_padding_mask: [B, Lt] for text padding
+        images: [B, Li, D]
+        texts:  [B, Lt, D]
+        key_padding_mask: [B, Lt] for text (True = pad)
         """
-        # Combine image and text for cross-modal processing
-        if self.type_bmco == 1:
-            # Interleaved combination
-            combined = torch.cat([images, texts], dim=1)  # [B, Li+Lt, D]
-            
-            # FIXED: Extend padding mask for combined sequence
-            if key_padding_mask is not None:
-                Li = images.size(1)
-                img_mask = torch.zeros(images.size(0), Li, 
-                                    device=images.device, dtype=torch.bool)
-                combined_mask = torch.cat([img_mask, key_padding_mask], dim=1)  # [B, Li+Lt]
-            else:
-                combined_mask = None
+        B, Li, _ = images.size()
+        Lt = texts.size(1)
+
+        # Combine (you can change ordering/strategy by type_bmco if needed)
+        combined = torch.cat([images, texts], dim=1)  # [B, Li+Lt, D]
+
+        # --- Build a correct combined mask for ALL branches ---
+        if key_padding_mask is not None:
+            # Ensure boolean, device, and width==Lt
+            text_mask = key_padding_mask.to(images.device).bool()
+            if text_mask.size(1) != Lt:
+                m = min(Lt, text_mask.size(1))
+                fixed = torch.zeros(B, Lt, dtype=torch.bool, device=images.device)
+                fixed[:, :m] = text_mask[:, :m]
+                text_mask = fixed
+            img_mask = torch.zeros(B, Li, dtype=torch.bool, device=images.device)
+            combined_mask = torch.cat([img_mask, text_mask], dim=1)  # [B, Li+Lt]
         else:
-            combined = torch.cat([images, texts], dim=1)
-            combined_mask = key_padding_mask
-        
-        # Apply cross-modal transformer layers
+            combined_mask = None
+
+        # Cross-modal encoder
         attended = combined
         for layer in self.cross_modal_layers:
             attended = layer(attended, src_key_padding_mask=combined_mask)
-        
-        # Knowledge-guided refinement (if knowledge available)
+
+        # Knowledge-guided refinement
         if knowledge_context is not None:
-            knowledge_guided, guidance_attn = self.knowledge_guidance(
-                query=attended,
-                key=knowledge_context,
-                value=knowledge_context
+            knowledge_guided, _ = self.knowledge_guidance(
+                query=attended, key=knowledge_context, value=knowledge_context
             )
-            
             gate = self.knowledge_gate(torch.cat([attended, knowledge_guided], dim=-1))
             attended = gate * knowledge_guided + (1 - gate) * attended
-        
-        # Split back into image and text components
-        Li, Lt = images.size(1), texts.size(1)
+
+        # Split back
         attended_images = self.image_adapter(attended[:, :Li, :])
-        attended_texts = self.text_adapter(attended[:, Li:Li+Lt, :])
-        
+        attended_texts  = self.text_adapter(attended[:, Li:Li+Lt, :])
         return attended_images, attended_texts
+
 
 class EnhancedHybridModel(nn.Module):
     """
