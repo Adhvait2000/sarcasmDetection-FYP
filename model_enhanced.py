@@ -418,11 +418,11 @@ class SuperiorHybridModel(nn.Module):
         )
         
     def forward(self, imgs, texts, mask_batch, img_edge_index, t1_word_seq,
-                txt_edge_index, gnn_mask, np_mask, knowledge_inputs, knowledge_masks):
+            txt_edge_index, gnn_mask, np_mask, knowledge_inputs, knowledge_masks):
         """
         Sophisticated forward pass with tri-modal fusion and knowledge conditioning
         """
-        # Enhanced text and knowledge encoding
+        # 1) Enhanced text and knowledge encoding
         texts_encoded, text_scores, knowledge_embeddings, knowledge_scores = self.txt_encoder(
             text_input=texts,
             knowledge_inputs=knowledge_inputs,
@@ -430,38 +430,29 @@ class SuperiorHybridModel(nn.Module):
             lam=self.lam
         )
         
-        # Sophisticated knowledge processing
-        pooled_knowledge = None
+        # 2) Cross-type knowledge pooling (FIXED)
+        pooled_knowledge_vec = None
+        refined_knowledge = None
         if knowledge_embeddings is not None:
-            # Convert knowledge embeddings to sequences for advanced pooling
-            knowledge_sequences = []
-            for i in range(len(self.knowledge_types)):
-                if i < knowledge_embeddings.size(1):
-                    # Create rich sequence representation from type embedding
-                    type_emb = knowledge_embeddings[:, i:i+1, :].expand(-1, 8, -1)
-                    knowledge_sequences.append(type_emb)
-                else:
-                    knowledge_sequences.append(None)
-            
-            # Apply sophisticated knowledge pooling (addresses bottleneck #3)
-            pooled_knowledge, knowledge_attn = self.knowledge_pooling(
-                knowledge_sequences, knowledge_scores, knowledge_masks
+            # Direct pooling of per-type vectors [B, K, D] -> [B, D] and [B, K, D]
+            pooled_knowledge_vec, refined_knowledge = self.knowledge_pooling(
+                knowledge_embeddings, knowledge_scores
             )
         
-        # Knowledge-conditioned image encoding (addresses bottleneck #2)
+        # 3) Knowledge-conditioned image encoding (uses refined per-type matrix)
         imgs_encoded, patch_weights = self.img_encoder(
-            imgs, knowledge_embeddings=pooled_knowledge, lam=self.lam
+            imgs, knowledge_embeddings=refined_knowledge, lam=self.lam
         )
         
-        # Knowledge-guided cross-modal interaction
+        # 4) Knowledge-guided cross-modal interaction
         imgs_attended, texts_attended = self.cross_modal_interaction(
             images=imgs_encoded,
             texts=texts_encoded,
-            knowledge_context=pooled_knowledge,
+            knowledge_context=refined_knowledge,  # Use refined per-type matrix
             key_padding_mask=mask_batch
         )
         
-        # Prepare representations for tri-modal fusion
+        # 5) Prepare representations for tri-modal fusion
         # Use attention-weighted pooling instead of simple averaging
         text_importance = self.confidence_estimator(texts_attended.mean(dim=1))[:, 0:1]
         img_importance = self.confidence_estimator(imgs_attended.mean(dim=1))[:, 1:2]
@@ -474,24 +465,23 @@ class SuperiorHybridModel(nn.Module):
             imgs_attended * patch_weights.unsqueeze(-1), dim=1, keepdim=True
         )
         
-        if pooled_knowledge is not None:
-            know_importance = self.confidence_estimator(pooled_knowledge.mean(dim=1))[:, 2:3]
-            know_weighted = torch.sum(
-                pooled_knowledge * know_importance.unsqueeze(-1), dim=1, keepdim=True
-            )
+        # 6) Tri-modal fusion
+        if pooled_knowledge_vec is not None:
+            know_importance = self.confidence_estimator(pooled_knowledge_vec)[:, 2:3]
+            know_weighted = pooled_knowledge_vec.unsqueeze(1) * know_importance.unsqueeze(-1)  # [B, 1, D]
             
             # Sophisticated tri-modal fusion (addresses bottleneck #1)
             fused_representation, fusion_attn = self.tri_modal_fusion(
-                text_feats=text_weighted,
-                img_feats=img_weighted,
-                know_feats=know_weighted
+                text_feats=text_weighted,   # [B, 1, D]
+                img_feats=img_weighted,     # [B, 1, D]
+                know_feats=know_weighted    # [B, 1, D]
             )
         else:
             # Fallback to bi-modal fusion
             combined = torch.cat([text_weighted, img_weighted], dim=1)
             fused_representation = combined.mean(dim=1)
         
-        # Final classification with rich representation
+        # 7) Final classification with rich representation
         predictions = self.classifier(fused_representation)
         
         return predictions
