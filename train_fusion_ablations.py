@@ -3,6 +3,7 @@ import argparse
 from train_enhanced import EnhancedTrainer
 from fusion.late_sum_hybrid import HybridLateSumModel
 from fusion.logit_gate_hybrid import HybridLogitGateModel
+from fusion.attn_weighted_hybrid import HybridAttnWeightedModel
 
 class FusionAblationTrainer(EnhancedTrainer):
     def __init__(self, model_type="hybrid", parameter_file="parameter.json", fusion="late_sum"):
@@ -41,16 +42,16 @@ class FusionAblationTrainer(EnhancedTrainer):
             return HybridLateSumModel(**common_kwargs)
         elif self._fusion_variant == "logit_gate":
             return HybridLogitGateModel(**common_kwargs)
+        elif self._fusion_variant == "attn_weighted":
+            return HybridAttnWeightedModel(**common_kwargs)   
         else:
             raise ValueError(f"Unknown fusion variant: {self._fusion_variant}")
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', type=str, default='hybrid',
-                        choices=['hybrid'], help='Fusion ablations currently for hybrid only')
+    parser.add_argument('--model_type', type=str, default='hybrid', choices=['hybrid'])
     parser.add_argument('--fusion', type=str, default='late_sum',
-                        choices=['late_sum', 'logit_gate'],
-                        help='Which fusion ablation to run')
+                        choices=['late_sum', 'logit_gate', 'attn_weighted']) 
     parser.add_argument('--parameter_file', type=str, default='parameter.json')
     parser.add_argument('--epochs', type=int, default=10)
     args = parser.parse_args()
