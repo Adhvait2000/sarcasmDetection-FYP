@@ -1,19 +1,21 @@
-# train_late_sum.py
+# train_late_sum.py  (now supports both late_sum & logit_gate)
 import argparse
-import json
-import torch
-
 from train_enhanced import EnhancedTrainer
 from fusion.late_sum_hybrid import HybridLateSumModel
+from fusion.logit_gate_hybrid import HybridLogitGateModel
 
-class LateSumTrainer(EnhancedTrainer):
+class FusionAblationTrainer(EnhancedTrainer):
+    def __init__(self, model_type="hybrid", parameter_file="parameter.json", fusion="late_sum"):
+        self._fusion_variant = fusion
+        super().__init__(model_type=model_type, parameter_file=parameter_file)
+
     def _initialize_model(self):
+        # For non-hybrid, use your original mapping
         if self.model_type != "hybrid":
-            # defer to your existing mapping for other model types
             return super()._initialize_model()
 
         p = self.parameter
-        return HybridLateSumModel(
+        common_kwargs = dict(
             txt_input_dim=p["txt_input_dim"],
             txt_out_size=p["txt_out_size"],
             img_input_dim=p["img_input_dim"],
@@ -32,21 +34,31 @@ class LateSumTrainer(EnhancedTrainer):
             img_gat_head=p["img_gat_head"],
             img_patch=p["img_patch"],
             lam=p["lambda"],
-            type_bmco=p["type_bmco"]
+            type_bmco=p["type_bmco"],
         )
+
+        if self._fusion_variant == "late_sum":
+            return HybridLateSumModel(**common_kwargs)
+        elif self._fusion_variant == "logit_gate":
+            return HybridLogitGateModel(**common_kwargs)
+        else:
+            raise ValueError(f"Unknown fusion variant: {self._fusion_variant}")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', type=str, default='hybrid',
-                        choices=['hybrid'], help='Late-sum ablation supports hybrid only')
+                        choices=['hybrid'], help='Fusion ablations currently for hybrid only')
+    parser.add_argument('--fusion', type=str, default='late_sum',
+                        choices=['late_sum', 'logit_gate'],
+                        help='Which fusion ablation to run')
     parser.add_argument('--parameter_file', type=str, default='parameter.json')
     parser.add_argument('--epochs', type=int, default=10)
     args = parser.parse_args()
 
-    trainer = LateSumTrainer(args.model_type, args.parameter_file)
+    trainer = FusionAblationTrainer(args.model_type, args.parameter_file, fusion=args.fusion)
     results = trainer.train(args.epochs)
 
-    print(f"\n[late_sum] Completed for {args.model_type}")
+    print(f"\n[{args.fusion}] Completed for {args.model_type}")
     print(f"Best Val F1: {results['best_val_f1']:.4f}")
     print(f"Test F1: {results['test_metrics']['f1']:.4f}")
 
