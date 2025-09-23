@@ -18,7 +18,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from model_enhanced import BaselineModel, KnowledgeOnlyModel, HybridModel, ImageOnlyModel
+from model_enhanced import BaselineModel, EnhancedKnowledgeOnlyModel, SuperiorHybridModel, ImageOnlyModel
 from utils.enhanced_dataset import EnhancedBaseSet, MultiKnowledgePadCollate
 from utils.data_utils import construct_edge_image, seed_everything
 from utils.compute_scores import get_metrics, get_four_metrics
@@ -55,26 +55,31 @@ class EnhancedTrainer:
         self.model = self._initialize_model()
         self.model.to(device=device)
         
-        # # Setup optimizer with proper learning rates
-        # head_lr = self.parameter.get("head_lr", self.parameter["lr"])
-        bert_params, new_params = [], []
+        # Setup optimizer with specialized learning rates
+        bert_params, fusion_params, classifier_params = [], [], []
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
             if "bert_model" in n or "bert" in n.lower():
                 bert_params.append(p)
+            elif any(keyword in n.lower() for keyword in ["fusion", "cross_modal", "tri_modal", "knowledge_pooling"]):
+                fusion_params.append(p)
+            elif any(keyword in n.lower() for keyword in ["classifier", "output_layer", "linear"]):
+                classifier_params.append(p)
             else:
-                new_params.append(p)
-        
+                fusion_params.append(p)  # Default to fusion group
+
         param_groups = []
         if bert_params:
-            param_groups.append({"params": bert_params, "lr": self.parameter["lr"]})
-        if new_params:
-            # Always same LR as BERT (paper-style single LR)
-            param_groups.append({"params": new_params, "lr": self.parameter["lr"]})
+            param_groups.append({"params": bert_params, "lr": 2e-5, "name": "bert"})
+        if fusion_params:
+            param_groups.append({"params": fusion_params, "lr": 1e-4, "name": "fusion"})
+        if classifier_params:
+            param_groups.append({"params": classifier_params, "lr": 1.5e-4, "name": "classifier"})
         if not param_groups:
-            param_groups = [{"params": self.model.parameters(), "lr": self.parameter["lr"]}]
+            param_groups = [{"params": self.model.parameters(), "lr": 2e-5}]
 
+        print(f"Optimizer groups: {[g.get('name', 'default') for g in param_groups]}")
         
         self.optimizer = optim.AdamW(
             param_groups,
@@ -91,7 +96,8 @@ class EnhancedTrainer:
             patience=self.parameter.get("patience", 3)
         )
         
-        self.criterion = CrossEntropyLoss()
+        # Class-weighted loss with label smoothing
+        self.criterion = CrossEntropyLoss(label_smoothing=0.05)
         
         # Initialize logger
         self.logger = Logger(f"logs/{model_type}_training")
@@ -151,8 +157,8 @@ class EnhancedTrainer:
                 lam=self.parameter["lambda"],
                 type_bmco=self.parameter["type_bmco"]
             )
-        elif self.model_type == "knowledge_only":
-            return KnowledgeOnlyModel(
+        elif self.model_type == "enhanced_knowledge_only":
+            return EnhancedKnowledgeOnlyModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
                 txt_out_size=self.parameter["txt_out_size"],
                 knowledge_types=[2, 3],  # ANP and attributes
@@ -165,8 +171,8 @@ class EnhancedTrainer:
                 txt_gat_head=self.parameter["txt_gat_head"],
                 lam=self.parameter["lambda"]
             )
-        elif self.model_type == "hybrid":
-            return HybridModel(
+        elif self.model_type == "superior_hybrid":
+            return SuperiorHybridModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
                 txt_out_size=self.parameter["txt_out_size"],
                 img_input_dim=self.parameter["img_input_dim"],
@@ -196,9 +202,9 @@ class EnhancedTrainer:
             return [1]  # Only captions
         elif self.model_type in ["image_only", "text_image"]:
             return []  # no external knowledge
-        elif self.model_type == "knowledge_only":
+        elif self.model_type == "enhanced_knowledge_only":
             return [2, 3]  # ANP and attributes
-        elif self.model_type == "hybrid":
+        elif self.model_type == "superior_hybrid":
             return [1, 2, 3]  # All knowledge types
 
     def _create_data_loaders(self):
@@ -321,11 +327,11 @@ class EnhancedTrainer:
                 print(f"  Images: {batch[0].shape if len(batch) > 0 else 'None'}")
                 print(f"  Batch length: {len(batch)}")
             
-            # Unpack batch data based on model type
-            if self.model_type == "knowledge_only":
+            # Unpack batch data based on the actual model class (robust)
+            if isinstance(self.model, EnhancedKnowledgeOnlyModel):
                 texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                 knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
-                
+
                 outputs = self.model(
                     texts=texts,
                     mask_batch=mask_batch,
@@ -336,19 +342,21 @@ class EnhancedTrainer:
                     knowledge_inputs=knowledge_inputs,
                     knowledge_masks=knowledge_masks
                 )
+
             elif self.model_type == "image_only":
                 imgs = batch[0].to(device)
                 outputs = self.model(imgs=imgs)
+
             else:
                 # Baseline, text_image, and hybrid models
                 imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                 gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
-                
+
                 # Debug shapes for first batch
                 if batch_idx == 0:
                     print(f"  Prepared imgs: {imgs.shape}")
                     print(f"  img_edge_index: {img_edge_index.shape}")
-                
+
                 outputs = self.model(
                     imgs=imgs,
                     texts=texts,
@@ -373,8 +381,7 @@ class EnhancedTrainer:
             loss.backward()
             
             # Gradient clipping
-            max_grad_norm = self.parameter.get("enhanced_model_config", {}).get("max_grad_norm", 1.0)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             
             self.optimizer.step()
             
@@ -401,11 +408,11 @@ class EnhancedTrainer:
         
         with torch.no_grad():
             for batch in tqdm(data_loader, desc=f"Evaluating {split}"):
-                # Prepare batch based on model type
-                if self.model_type == "knowledge_only":
+                # Prepare batch based on the actual model class (robust)
+                if isinstance(self.model, EnhancedKnowledgeOnlyModel):
                     texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                     knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
-                    
+
                     outputs = self.model(
                         texts=texts,
                         mask_batch=mask_batch,
@@ -416,13 +423,15 @@ class EnhancedTrainer:
                         knowledge_inputs=knowledge_inputs,
                         knowledge_masks=knowledge_masks
                     )
+
                 elif self.model_type == "image_only":
                     imgs = batch[0].to(device)
                     outputs = self.model(imgs=imgs)
+
                 else:
                     imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
-                    
+
                     outputs = self.model(
                         imgs=imgs,
                         texts=texts,
@@ -573,8 +582,10 @@ class EnhancedTrainer:
         """Main training loop"""
         print(f"\nTraining {self.model_type} model...")
         print(f"Device: {device}")
+        print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}")
         print(f"Batch size: {self.parameter['batch_size']}")
-        print(f"Learning rate: {self.parameter['lr']}")
+        print(f"Base learning rate: 2e-5 (specialized rates)")
         print(f"Epochs: {num_epochs}")
         
         # Create data loaders
@@ -678,7 +689,7 @@ class EnhancedTrainer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', type=str, default='baseline',
-                       choices=['baseline', 'knowledge_only', 'hybrid', 'image_only', 'text_image'],
+                       choices=['baseline', 'enhanced_knowledge_only', 'superior_hybrid', 'image_only', 'text_image'],
                        help='Model type to train')
     parser.add_argument('--parameter_file', type=str, default='parameter.json',
                        help='Path to parameter file')
@@ -696,4 +707,4 @@ def main():
     print(f"Test F1: {results['test_metrics']['f1']:.4f}")
 
 if __name__ == "__main__":
-    main() 
+    main()
