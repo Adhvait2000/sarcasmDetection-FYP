@@ -8,29 +8,65 @@ from model_enhanced import Alignment, pool_tokens_to_words_batch
 
 class MultiLogitGateFusion(nn.Module):
     """
-    N-branch, per-class soft mixture of logits.
-    Inputs: list of logits [ [B,C], ..., K times ]
-    Output: [B,C] with per-class gates over branches.
+    N-branch, per-class soft mixture of logits with temperature, optional prior,
+    and a small residual blend toward the uniform/average to improve robustness.
     """
-    def __init__(self, num_branches: int, num_classes: int = 2):
+    def __init__(
+        self,
+        num_branches: int,
+        num_classes: int = 2,
+        tau: float = 1.0,                   # gate temperature (learnable)
+        beta: float = 0.1,                  # residual blend toward average logits
+        use_prior: bool = True,             # add learnable per-branch, per-class bias
+        clamp_tau: tuple = (0.5, 5.0),      # safety clamp for temperature
+    ):
         super().__init__()
         self.num_branches = num_branches
         self.num_classes = num_classes
+
         self.gate = nn.Sequential(
             nn.Linear(num_branches * num_classes, num_branches * num_classes),
             nn.Sigmoid()
         )
 
+        self.tau = nn.Parameter(torch.tensor(float(tau)))
+        self.tau_min, self.tau_max = clamp_tau
+
+        self.use_prior = use_prior
+        if use_prior:
+            self.prior = nn.Parameter(torch.zeros(num_branches, num_classes))
+
+        self.beta = nn.Parameter(torch.tensor(float(beta)), requires_grad=False)
+
+        self.last_gate_weights: torch.Tensor | None = None  # requires Python 3.10+
+
     def forward(self, logits_list):
         # logits_list: length K, each [B,C]
-        B, C = logits_list[0].shape
         K = len(logits_list)
-        x = torch.cat(logits_list, dim=-1)                    # [B, K*C]
-        g = self.gate(x).view(B, K, C)                        # [B,K,C]
-        g = torch.softmax(g, dim=1)                           # per-class weights over branches
-        stacked = torch.stack(logits_list, dim=1)             # [B,K,C]
-        out = (g * stacked).sum(dim=1)                        # [B,C]
+        assert K == self.num_branches and K > 0, f"expected {self.num_branches} branches, got {K}"
+        B, C = logits_list[0].shape
+
+        x = torch.cat(logits_list, dim=-1)              # [B, K*C]
+        g = self.gate(x).view(B, K, C)                  # [B,K,C]
+
+        tau = self.tau.clamp(min=self.tau_min, max=self.tau_max)
+        if self.use_prior:
+            g = g + self.prior.unsqueeze(0)             # [1,K,C] -> broadcast
+
+        g = g - g.max(dim=1, keepdim=True)[0]           # stabilize
+        g = g / tau
+        g = torch.softmax(g, dim=1)                     # per-class over branches
+        g = torch.nan_to_num(g, nan=0.0)
+
+        stacked = torch.stack(logits_list, dim=1)       # [B,K,C]
+        gated = (g * stacked).sum(dim=1)                # [B,C]
+
+        avg = stacked.mean(dim=1)                       # [B,C]
+        out = (1.0 - self.beta) * gated + self.beta * avg
+
+        self.last_gate_weights = g.detach()
         return out
+
 
 class KnowledgeOnlyLogitGateModel(nn.Module):
     """

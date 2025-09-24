@@ -13,6 +13,7 @@ import torch
 import time
 from torch.nn import CrossEntropyLoss
 import numpy as np
+import torch.nn.functional as F
 import json
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 import matplotlib.pyplot as plt
@@ -37,6 +38,7 @@ def _move_tokenizer_batch_to_device(batch_dict, device):
         return None
     return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch_dict.items()}
 
+    
 class EnhancedTrainer:
     def __init__(self, model_type="baseline", parameter_file="parameter.json"):
         """
@@ -91,7 +93,9 @@ class EnhancedTrainer:
             patience=self.parameter.get("patience", 3)
         )
         
-        self.criterion = CrossEntropyLoss()
+        # self.criterion = CrossEntropyLoss()
+
+        self.criterion = self._make_criterion()
         
         # Initialize logger
         self.logger = Logger(f"logs/{model_type}_training")
@@ -108,6 +112,39 @@ class EnhancedTrainer:
         "caption_attr",
         }  
 
+    def _make_criterion(self):
+        """
+        Creates the loss based on parameter.json config.
+
+        Supported keys:
+          - "loss": "ce" (default)
+          - "class_weights": [w0, w1]  # explicit per-class weights
+          - "pos_weight": float        # convenience for binary: expands to [1.0, pos_weight]
+          - "label_smoothing": float   # PyTorch CE label smoothing
+        """
+        cfg = self.parameter
+        loss_type = cfg.get("loss", "ce").lower()
+
+        # Option A: explicit per-class weights
+        class_weights = cfg.get("class_weights", None)
+
+        # Option B: convenience positive-class upweight (overrides nothing if class_weights is provided)
+        if class_weights is None and "pos_weight" in cfg:
+            class_weights = [1.0, float(cfg["pos_weight"])]
+
+        label_smoothing = float(cfg.get("label_smoothing", 0.0))
+
+        if loss_type == "ce":
+            weight_tensor = None
+            if class_weights is not None:
+                weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+            return CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
+
+        # Default fallback to CE if an unknown loss is specified
+        weight_tensor = None
+        if class_weights is not None:
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        return CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
         
     def _initialize_model(self):
         """Initialize model based on type"""
