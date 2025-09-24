@@ -22,6 +22,7 @@ from model_enhanced import BaselineModel, KnowledgeOnlyModel, HybridModel, Image
 from utils.enhanced_dataset import EnhancedBaseSet, MultiKnowledgePadCollate
 from utils.data_utils import construct_edge_image, seed_everything
 from utils.compute_scores import get_metrics, get_four_metrics
+from fusion.logit_gate_knowledge import KnowledgeOnlyLogitGateModel
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -74,7 +75,6 @@ class EnhancedTrainer:
             param_groups.append({"params": new_params, "lr": self.parameter["lr"]})
         if not param_groups:
             param_groups = [{"params": self.model.parameters(), "lr": self.parameter["lr"]}]
-
         
         self.optimizer = optim.AdamW(
             param_groups,
@@ -99,6 +99,15 @@ class EnhancedTrainer:
         # Early Stopping parameters
         self.early_stopping_patience = self.parameter.get("early_stopping_patience", 3)
         self.early_stop_min_delta = self.parameter.get("early_stop_min_delta", 0.001)
+
+        self.KNOW_ABLATIONS = {
+        "knowledge_only",
+        "knowledge_only_anp",
+        "knowledge_only_attr",
+        "caption_anp",
+        "caption_attr",
+        }  
+
         
     def _initialize_model(self):
         """Initialize model based on type"""
@@ -151,11 +160,13 @@ class EnhancedTrainer:
                 lam=self.parameter["lambda"],
                 type_bmco=self.parameter["type_bmco"]
             )
-        elif self.model_type == "knowledge_only":
-            return KnowledgeOnlyModel(
+        elif self.model_type in ["knowledge_only", "knowledge_only_anp", 
+                           "knowledge_only_attr", "caption_anp", "caption_attr"]:
+            # All knowledge ablations use the logit gate model
+            return KnowledgeOnlyLogitGateModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
                 txt_out_size=self.parameter["txt_out_size"],
-                knowledge_types=[2, 3],  # ANP and attributes
+                knowledge_types=self._get_knowledge_types(),
                 max_knowledge_length=self.parameter.get("know_max_length", 20),
                 cro_layers=self.parameter["cro_layers"],
                 cro_heads=self.parameter["cro_heads"],
@@ -191,15 +202,23 @@ class EnhancedTrainer:
             raise ValueError(f"Unknown model type: {self.model_type}")
     
     def _get_knowledge_types(self):
-        """Get knowledge types based on model type"""
         if self.model_type == "baseline":
-            return [0]  # Only captions
+            return [1]  # captions
         elif self.model_type in ["image_only", "text_image"]:
-            return []  # no external knowledge
+            return []
         elif self.model_type == "knowledge_only":
-            return [2, 3]  # ANP and attributes
+            return [2, 3]          # ANP + ATTR
+        elif self.model_type == "knowledge_only_anp":
+            return [2]             # ANP only
+        elif self.model_type == "knowledge_only_attr":
+            return [3]             # ATTR only
+        elif self.model_type == "caption_anp":
+            return [1, 2]          # CAP + ANP
+        elif self.model_type == "caption_attr":
+            return [1, 3]          # CAP + ATTR
         elif self.model_type == "hybrid":
-            return [1, 2, 3]  # All knowledge types
+            return [1, 2, 3]        # CAP + ANP + ATTR
+
 
     def _create_data_loaders(self):
         """Create data loaders for the specific model type"""
@@ -306,26 +325,31 @@ class EnhancedTrainer:
             return batch_tensor
         
     def train_epoch(self, train_loader):
+
         """Train for one epoch"""
         self.model.train()
-        total_loss = 0
+        total_loss = 0.0
         correct = 0
         total = 0
-        
+
         progress_bar = tqdm(train_loader, desc="Training")
-        
+
         for batch_idx, batch in enumerate(progress_bar):
             # Debug first batch
             if batch_idx == 0:
-                print(f"\nFirst batch shapes:")
-                print(f"  Images: {batch[0].shape if len(batch) > 0 else 'None'}")
+                try:
+                    img_shape = batch[0].shape if hasattr(batch[0], "shape") else "None"
+                except Exception:
+                    img_shape = "N/A"
+                print("\nFirst batch shapes:")
+                print(f"  Images: {img_shape}")
                 print(f"  Batch length: {len(batch)}")
-            
-            # Unpack batch data based on model type
-            if self.model_type == "knowledge_only":
+
+            # ---- Forward pass (by model type) ----
+            if self.model_type in self.KNOW_ABLATIONS:
                 texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                 knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
-                
+
                 outputs = self.model(
                     texts=texts,
                     mask_batch=mask_batch,
@@ -334,21 +358,22 @@ class EnhancedTrainer:
                     gnn_mask=gnn_mask,
                     np_mask=np_mask,
                     knowledge_inputs=knowledge_inputs,
-                    knowledge_masks=knowledge_masks
+                    knowledge_masks=knowledge_masks,
                 )
+
             elif self.model_type == "image_only":
                 imgs = batch[0].to(device)
                 outputs = self.model(imgs=imgs)
+
             else:
-                # Baseline, text_image, and hybrid models
+                # baseline, text_image, hybrid
                 imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                 gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
-                
-                # Debug shapes for first batch
+
                 if batch_idx == 0:
                     print(f"  Prepared imgs: {imgs.shape}")
                     print(f"  img_edge_index: {img_edge_index.shape}")
-                
+
                 outputs = self.model(
                     imgs=imgs,
                     texts=texts,
@@ -359,53 +384,46 @@ class EnhancedTrainer:
                     gnn_mask=gnn_mask,
                     np_mask=np_mask,
                     knowledge_inputs=knowledge_inputs,
-                    knowledge_masks=knowledge_masks
+                    knowledge_masks=knowledge_masks,
                 )
-            
-            # Get labels (always at index 8)
+
+            # ---- Loss & backward ----
             labels = batch[8].to(device)
-            
-            # Compute loss
             loss = self.criterion(outputs, labels)
-            
-            # Backward pass
+
             self.optimizer.zero_grad()
             loss.backward()
-            
-            # Gradient clipping
+
             max_grad_norm = self.parameter.get("enhanced_model_config", {}).get("max_grad_norm", 1.0)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
-            
+
             self.optimizer.step()
-            
-            # Statistics
+
+            # ---- Stats ----
             total_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-            
-            # Update progress bar
+
             progress_bar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
-                'Acc': f'{100 * correct / total:.2f}%'
+                "Loss": f"{loss.item():.4f}",
+                "Acc": f"{100.0 * correct / max(total,1):.2f}%"
             })
-        
-        return total_loss / len(train_loader), 100 * correct / total
+
+        return total_loss / max(len(train_loader), 1), 100.0 * correct / max(total, 1)
     
     def evaluate(self, data_loader, split="val"):
         """Evaluate model performance"""
         self.model.eval()
-        total_loss = 0
-        all_predictions = []
-        all_labels = []
-        
+        total_loss = 0.0
+        all_predictions, all_labels = [], []
+
         with torch.no_grad():
             for batch in tqdm(data_loader, desc=f"Evaluating {split}"):
-                # Prepare batch based on model type
-                if self.model_type == "knowledge_only":
+                if self.model_type in self.KNOW_ABLATIONS:
                     texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
                     knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
-                    
+
                     outputs = self.model(
                         texts=texts,
                         mask_batch=mask_batch,
@@ -414,15 +432,17 @@ class EnhancedTrainer:
                         gnn_mask=gnn_mask,
                         np_mask=np_mask,
                         knowledge_inputs=knowledge_inputs,
-                        knowledge_masks=knowledge_masks
+                        knowledge_masks=knowledge_masks,
                     )
+
                 elif self.model_type == "image_only":
                     imgs = batch[0].to(device)
                     outputs = self.model(imgs=imgs)
+
                 else:
                     imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
-                    
+
                     outputs = self.model(
                         imgs=imgs,
                         texts=texts,
@@ -433,38 +453,33 @@ class EnhancedTrainer:
                         gnn_mask=gnn_mask,
                         np_mask=np_mask,
                         knowledge_inputs=knowledge_inputs,
-                        knowledge_masks=knowledge_masks
+                        knowledge_masks=knowledge_masks,
                     )
-                
-                # Get labels
+
                 labels = batch[8].to(device)
-                
-                # Compute loss
                 loss = self.criterion(outputs, labels)
                 total_loss += loss.item()
-                
-                # Store predictions
+
                 _, predicted = torch.max(outputs.data, 1)
                 all_predictions.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-        
-        # Compute metrics
+
+        # Metrics
         accuracy = accuracy_score(all_labels, all_predictions)
         precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels, all_predictions, average='weighted'
+            all_labels, all_predictions, average="weighted"
         )
-        
-        # Confusion matrix
         cm = confusion_matrix(all_labels, all_predictions)
-        
+
         return {
-            'loss': total_loss / len(data_loader),
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'confusion_matrix': cm
+            "loss": total_loss / max(len(data_loader), 1),
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "confusion_matrix": cm,
         }
+
     
     def _prepare_batch(self, batch):
         """
@@ -678,7 +693,8 @@ class EnhancedTrainer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', type=str, default='baseline',
-                       choices=['baseline', 'knowledge_only', 'hybrid', 'image_only', 'text_image'],
+                       choices=['baseline','knowledge_only','hybrid','image_only','text_image',
+         'knowledge_only_anp','knowledge_only_attr','caption_anp','caption_attr'],
                        help='Model type to train')
     parser.add_argument('--parameter_file', type=str, default='parameter.json',
                        help='Path to parameter file')
