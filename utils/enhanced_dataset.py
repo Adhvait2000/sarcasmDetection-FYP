@@ -257,7 +257,7 @@ class MultiKnowledgePadCollate:
             is_split_into_words=True,
             return_tensors="pt",
             truncation=True,
-            max_length=text_max_length,
+            max_length=self.text_max_length,
             padding=True
         )
 
