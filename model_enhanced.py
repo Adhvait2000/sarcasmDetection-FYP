@@ -534,19 +534,22 @@ class HybridModel(nn.Module):
         # Generate predictions
         text_image_pred = self.text_image_output(weighted_text_image)
 
-        B_, twoK = knowledge_alignment.shape
-        if twoK == 0:
-            knowledge_pred = torch.zeros(B_, 2, device=knowledge_alignment.device, dtype=knowledge_alignment.dtype)
+        if fused_knowledge.size(1) == 0:
+            knowledge_pred = torch.zeros(
+                fused_knowledge.size(0), 2,
+                device=fused_knowledge.device,
+                dtype=fused_knowledge.dtype
+            )
         else:
-            K = twoK // 2
-            a1 = knowledge_alignment[:, :K]   # [B, K]
-            a2 = knowledge_alignment[:, K:]   # [B, K]
-            stacked = torch.stack([a1, a2], dim=1)           # [B, 2, K]
-            knowledge_pred = F.adaptive_avg_pool1d(stacked, 1).squeeze(-1)  # [B, 2]
+            # If you have a padding mask per knowledge token with True=pad, you can do a masked mean.
+            # Otherwise, a simple mean over tokens is a safe default:
+            pooled = fused_knowledge.mean(dim=1)             # [B, txt_out_size]
+            knowledge_pred = self.knowledge_output(pooled)   # [B, 2]
+
         
         # Final fusion
-        combined_features = torch.cat([text_image_pred, knowledge_pred], dim=-1)
-        predictions = self.final_fusion(combined_features)
+        combined_features = torch.cat([text_image_pred, knowledge_pred], dim=-1)  # [B, 4]
+        predictions = self.final_fusion(combined_features)                        # [B, 2] 
         
         return predictions
 
