@@ -27,23 +27,81 @@ class KnowledgeExtractor:
 
         # Predefined ANP templates for better extraction
         self.anp_templates = [
-            "{}",  
+            # Direct/Simple
+            "{}",
+            "a {}",
+            "an {}",
+            "the {}",
+            
+            # Photo/Image context
             "a photo of {}",
-            "an image of {}", 
-            "a {} person", "a {} object", "a {} scene", "a {} animal",
-            "a {} building", "a {} vehicle", "a {} food", "a {} plant"
+            "an image of {}",
+            "a picture of {}",
+            "photo of {}",
+            "image of {}",
+            
+            # Spatial/Contextual
+            "{} in the image",
+            "{} in the photo",
+            "{} in the scene",
+            "a {} here",
+            "this {}",
+            "this is a {}",
+            "showing a {}",
+            "contains a {}",
+            
+            # Category-specific (your existing ones)
+            "a {} person",
+            "a {} object", 
+            "a {} scene",
+            "a {} animal",
+            "a {} building",
+            "a {} vehicle",
+            "a {} food",
+            "a {} plant",
+            
+            # Activity/State
+            "a {} doing something",
+            "a {} that is",
+            "looking at a {}"
         ]
 
         # Common attributes for filtering
         self.emotional_attributes = [
-            "happy", "sad", "angry", "surprised", "confused", "excited",
-            "bored", "worried", "proud", "embarrassed", "amused", "frustrated"
+            # Basic emotions
+            "happy", "sad", "angry", "surprised", "confused", "excited", 
+            "bored", "worried", "proud", "embarrassed", "amused", "frustrated",
+            
+            # Extended emotions
+            "joyful", "cheerful", "melancholy", "depressed", "furious", "calm",
+            "peaceful", "anxious", "nervous", "confident", "shy", "bold",
+            "serious", "playful", "mysterious", "friendly", "hostile"
         ]
         self.stylistic_attributes = [
-            "bright", "dark", "colorful", "monochrome", "blurry", "sharp",
-            "modern", "vintage", "casual", "formal", "messy", "clean"
+            # Visual properties
+            "bright", "dark", "colorful", "monochrome", "black and white",
+            "blurry", "sharp", "clear", "focused", "out of focus",
+            
+            # Style/Era
+            "modern", "vintage", "retro", "contemporary", "classic", "old",
+            "new", "ancient", "futuristic", "traditional",
+            
+            # Condition/State
+            "clean", "dirty", "messy", "organized", "neat", "broken", "damaged",
+            "worn", "shiny", "dull", "smooth", "rough", "wet", "dry",
+            
+            # Formality
+            "casual", "formal", "elegant", "simple", "complex", "fancy", "plain",
+            
+            # Size/Scale
+            "big", "small", "large", "tiny", "huge", "massive", "mini",
+            
+            # Quality/Aesthetic
+            "beautiful", "ugly", "pretty", "gorgeous", "stunning", "attractive",
+            "artistic", "creative", "professional", "amateur"
         ]
-
+        
+        
         # ===== Text caches =====
         self._cached_anp_strings: Optional[List[str]] = None
         self._cached_anp_text_features: Optional[torch.Tensor] = None  # [N, D] on device
@@ -68,13 +126,48 @@ class KnowledgeExtractor:
         """Generate candidate ANPs using templates and common nouns."""
         candidates = []
         common_nouns = [
-            "person", "man", "woman", "child", "baby", "boy", "girl",
-            "car", "truck", "bike", "bus", "train", "plane",
-            "house", "building", "office", "school", "hospital",
-            "dog", "cat", "bird", "fish", "horse", "cow",
-            "tree", "flower", "grass", "mountain", "river", "ocean",
-            "food", "pizza", "burger", "cake", "fruit", "vegetable",
-            "phone", "computer", "book", "chair", "table", "bed"
+            # People
+            "person", "man", "woman", "child", "baby", "boy", "girl", "adult", "teenager",
+            "crowd", "group", "family", "couple", "individual", "human", "people",
+            
+            # Animals
+            "dog", "cat", "bird", "fish", "horse", "cow", "pig", "sheep", "chicken",
+            "elephant", "lion", "tiger", "bear", "monkey", "rabbit", "deer", "wolf",
+            "animal", "pet", "wildlife", "insect", "butterfly", "bee",
+            
+            # Vehicles
+            "car", "truck", "bike", "bicycle", "motorcycle", "bus", "train", "plane",
+            "airplane", "helicopter", "boat", "ship", "vehicle", "scooter", "van",
+            
+            # Buildings/Places
+            "house", "building", "office", "school", "hospital", "church", "store",
+            "restaurant", "hotel", "bridge", "tower", "castle", "barn", "garage",
+            "room", "kitchen", "bedroom", "bathroom", "street", "road", "park",
+            
+            # Nature
+            "tree", "flower", "grass", "mountain", "river", "ocean", "lake", "forest",
+            "beach", "sky", "cloud", "sun", "moon", "rock", "stone", "hill", "field",
+            "garden", "plant", "leaf", "branch", "water", "fire", "smoke",
+            
+            # Food
+            "food", "pizza", "burger", "sandwich", "cake", "bread", "fruit", "apple",
+            "banana", "orange", "vegetable", "salad", "meat", "chicken", "fish",
+            "drink", "coffee", "tea", "water", "wine", "beer", "meal",
+            
+            # Objects
+            "phone", "computer", "laptop", "book", "chair", "table", "bed", "sofa",
+            "television", "tv", "screen", "camera", "clock", "lamp", "bottle", "cup",
+            "glass", "plate", "knife", "fork", "bag", "box", "ball", "toy", "game",
+            "tool", "machine", "device", "equipment", "instrument",
+            
+            # Clothing/Accessories
+            "shirt", "pants", "dress", "shoes", "hat", "jacket", "coat", "glasses",
+            "watch", "jewelry", "ring", "necklace", "bag", "purse", "clothes",
+            
+            # Abstract/General
+            "object", "thing", "item", "stuff", "material", "surface", "shape",
+            "color", "pattern", "texture", "design", "art", "artwork", "painting",
+            "sign", "text", "number", "letter", "symbol", "logo", "brand"
         ]
         for template in self.anp_templates:
             for noun in common_nouns:
