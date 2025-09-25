@@ -124,8 +124,12 @@ def main():
     extractor.clip_model.eval()
 
     # One-time caches (on device)
+    print(f"[INFO] Found {len(files)} files")
+    print(f"[INFO] Building ANP cache...")
     extractor._ensure_cached_anp_text_features()
+    print(f"[INFO] ANP cache complete. Building attribute cache...")
     extractor.ensure_cached_attribute_text_features()
+    print(f"[INFO] All caches ready. Starting processing...")
 
     candidate_anps = extractor._cached_anp_strings
     anp_text_features = extractor._cached_anp_text_features  # [N, D] normalized
