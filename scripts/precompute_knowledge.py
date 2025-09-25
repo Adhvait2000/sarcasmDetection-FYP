@@ -1,8 +1,13 @@
 import argparse, json
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Union
-from PIL import Image
-from utils.knowledge_extractor import KnowledgeExtractor  
+from PIL import Image, ImageFile
+from utils.knowledge_extractor import KnowledgeExtractor
+import torch
+from tqdm import tqdm
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 def as_list_of_str(
@@ -31,21 +36,17 @@ def as_list_of_str(
 
 def extract_one(p: Path, extractor: KnowledgeExtractor,
                 conf_thr: float, max_per_type: int) -> Dict:
-    # Open image (RGB)
     with Image.open(p) as im:
         im = im.convert("RGB")
-
-    # 1) ANPs (list of (str, score))
     anps_scored = extractor.extract_anps_with_clip(im, max_anps=max_per_type*2)
     anps_text = as_list_of_str(anps_scored, conf_thr, max_per_type)
-
-    # 2) Attributes (list of (str, score)) — pass ANP strings
     attrs_scored = extractor.extract_attributes(im, anps_text)
     attrs_text = as_list_of_str(attrs_scored, conf_thr, max_per_type)
-
     return {"image_id": p.stem, "anps": anps_text, "attributes": attrs_text}
 
 def main():
+    torch.set_grad_enabled(False)
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw_image_root", required=True)
     ap.add_argument("--out", required=True)
@@ -59,25 +60,30 @@ def main():
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
 
     files = sorted([p for p in root.rglob("*") if p.suffix.lower() in IMG_EXTS])
-    if args.limit > 0: files = files[:args.limit]
+    if args.limit > 0:
+        files = files[:args.limit]
     if not files:
-        print(f"[WARN] No images in {root}"); return
+        print(f"[WARN] No images in {root}")
+        return
 
-    extractor = KnowledgeExtractor(confidence_threshold=args.confidence_threshold)
-    extractor.clip_model.eval()  # inference mode
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] Using device: {device}")
 
+    extractor = KnowledgeExtractor(
+        confidence_threshold=args.confidence_threshold,
+        device=device
+    )
+    extractor.clip_model.eval()
+
+    ok = fail = 0
     with out.open("w", encoding="utf-8") as fw:
-        ok = fail = 0
-        for i, p in enumerate(files, 1):
+        for p in tqdm(files, desc="Precomputing"):
             try:
                 rec = extract_one(p, extractor, args.confidence_threshold, args.max_per_type)
                 fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 ok += 1
-            except Exception as e:
+            except Exception:
                 fail += 1
-                # Optional: print(f"[ERR] {p}: {e}")
-            if i % 500 == 0:
-                print(f"[INFO] processed {i}/{len(files)} ...")
     print(f"[DONE] wrote {ok} records to {out} (failures: {fail})")
 
 if __name__ == "__main__":
