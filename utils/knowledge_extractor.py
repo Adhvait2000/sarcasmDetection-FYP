@@ -27,6 +27,9 @@ class KnowledgeExtractor:
 
         # Predefined ANP templates for better extraction
         self.anp_templates = [
+            "{}",  
+            "a photo of {}",
+            "an image of {}", 
             "a {} person", "a {} object", "a {} scene", "a {} animal",
             "a {} building", "a {} vehicle", "a {} food", "a {} plant"
         ]
