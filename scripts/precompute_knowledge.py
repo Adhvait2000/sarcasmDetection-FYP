@@ -8,7 +8,6 @@ import torch
 from utils.knowledge_extractor import KnowledgeExtractor
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 def as_list_of_str(
@@ -46,47 +45,13 @@ def rank_anps_for_features(
     confidence_threshold: float,
     max_return: int,
 ) -> List[Tuple[str, float]]:
-    """
-    image_feat: [D] normalized
-    anp_text_features: [N, D] normalized
-    """
     sim = (image_feat.unsqueeze(0) @ anp_text_features.T).squeeze(0)  # [N]
     k = min(max_return, sim.numel())
-    topk = torch.topk(sim, k=k, largest=True)
+    vals, idxs = torch.topk(sim, k=k, largest=True)
     out: List[Tuple[str, float]] = []
-    for idx, score in zip(topk.indices.tolist(), topk.values.tolist()):
-        if score >= confidence_threshold:
-            out.append((candidate_anps[idx], float(score)))
-    return out
-
-def build_attribute_candidates(emotional: List[str], stylistic: List[str], anps: List[str]) -> List[str]:
-    all_attrs = emotional + stylistic
-    cands: List[str] = []
-    for anp in anps:
-        for attr in all_attrs:
-            cands.append(f"{attr} {anp}")
-    return cands
-
-def rank_attributes_for_features(
-    image_feat: torch.Tensor,
-    attribute_candidates: List[str],
-    encode_texts_to_device_tensor,  # extractor._encode_texts_to_device_tensor
-    confidence_threshold: float,
-    top_k: int = 20,
-) -> List[Tuple[str, float]]:
-    """
-    image_feat: [D] normalized
-    """
-    if not attribute_candidates:
-        return []
-    text_feats = encode_texts_to_device_tensor(attribute_candidates)  # [M, D], normalized
-    sim = (image_feat.unsqueeze(0) @ text_feats.T).squeeze(0)  # [M]
-    k = min(top_k, sim.numel())
-    topk = torch.topk(sim, k=k, largest=True)
-    out: List[Tuple[str, float]] = []
-    for idx, score in zip(topk.indices.tolist(), topk.values.tolist()):
-        if score >= confidence_threshold:
-            out.append((attribute_candidates[idx], float(score)))
+    for i, v in zip(idxs.tolist(), vals.tolist()):
+        if v >= confidence_threshold:
+            out.append((candidate_anps[i], float(v)))
     return out
 
 def main():
@@ -119,49 +84,47 @@ def main():
         confidence_threshold=args.confidence_threshold,
         device=device
     )
-    extractor.clip_model.eval()  # paranoia
+    extractor.clip_model.eval()
 
-    # Pre-cache ANP text features on device
+    # One-time caches (on device)
     extractor._ensure_cached_anp_text_features()
-    candidate_anps = extractor._cached_anp_strings
-    anp_text_features = extractor._cached_anp_text_features  # [N, D] on device
+    extractor.ensure_cached_attribute_text_features()
 
-    # Shorthands for attributes
-    emotional = extractor.emotional_attributes
-    stylistic = extractor.stylistic_attributes
+    candidate_anps = extractor._cached_anp_strings
+    anp_text_features = extractor._cached_anp_text_features  # [N, D] normalized
+    attr_texts = extractor._attr_all_texts                   # list of all attr prompts
+    attr_feats = extractor._attr_all_text_features           # [M, D] normalized
+    anp_to_attr_indices = extractor._attr_anp_to_indices     # ANP -> list[int]
 
     ok = fail = 0
-    batch_size = max(1, args.batch_size)
+    B = max(1, args.batch_size)
 
     with out.open("w", encoding="utf-8") as fw:
-        # Iterate in batches of file paths
-        for i in tqdm(range(0, len(files), batch_size), desc="Precomputing"):
-            batch_paths = files[i : i + batch_size]
+        for i in tqdm(range(0, len(files), B), desc="Precomputing", dynamic_ncols=True, leave=True):
+            batch_paths = files[i : i + B]
 
-            # 1) Load images (skip failures)
+            # 1) Load images for this batch
             imgs: List[Image.Image] = []
             img_ids: List[str] = []
-            valid_idx: List[int] = []
-            for j, p in enumerate(batch_paths):
+            for p in batch_paths:
                 try:
                     im = load_image_rgb(p)
                     imgs.append(im)
                     img_ids.append(p.stem)
-                    valid_idx.append(j)
                 except Exception:
                     fail += 1
 
             if not imgs:
-                continue  # all failed
+                continue
 
-            # 2) Encode images in one go -> [B, D]
+            # 2) Encode batch images -> [B, D]
             img_inputs = extractor.clip_processor(images=imgs, return_tensors="pt").to(extractor.device)
             with torch.inference_mode():
                 with extractor._autocast():
                     img_feats = extractor.clip_model.get_image_features(**img_inputs)  # [B, D]
             img_feats = img_feats / img_feats.norm(dim=-1, keepdim=True)
 
-            # 3) For each image in batch: rank ANPs, then attributes, write JSONL
+            # 3) Per image: rank ANPs, then gather attribute rows and rank
             for b in range(img_feats.size(0)):
                 try:
                     # ANPs
@@ -170,20 +133,27 @@ def main():
                         candidate_anps=candidate_anps,
                         anp_text_features=anp_text_features,
                         confidence_threshold=args.confidence_threshold,
-                        max_return=args.max_per_type * 2,  # extra then filter
+                        max_return=args.max_per_type * 2,  # overselect then filter
                     )
                     anps_text = as_list_of_str(anps_scored, args.confidence_threshold, args.max_per_type)
 
-                    # Attributes (candidates depend on this image's ANPs)
-                    attr_cands = build_attribute_candidates(emotional, stylistic, anps_text)
-                    attrs_scored = rank_attributes_for_features(
-                        image_feat=img_feats[b],
-                        attribute_candidates=attr_cands,
-                        encode_texts_to_device_tensor=extractor._encode_texts_to_device_tensor,
-                        confidence_threshold=args.confidence_threshold,
-                        top_k=20,
-                    )
-                    attrs_text = as_list_of_str(attrs_scored, args.confidence_threshold, args.max_per_type)
+                    # Attributes: gather rows for these ANPs
+                    idxs: List[int] = []
+                    for anp in anps_text:
+                        idxs.extend(anp_to_attr_indices.get(anp, []))
+                    if idxs:
+                        sub = attr_feats[idxs]  # [K, D]
+                        sim = (img_feats[b].unsqueeze(0) @ sub.T).squeeze(0)  # [K]
+                        k = min(20, sim.numel())
+                        vals, rel = torch.topk(sim, k=k, largest=True)
+                        attrs_scored: List[Tuple[str, float]] = []
+                        for sub_i, v in zip(rel.tolist(), vals.tolist()):
+                            if v >= args.confidence_threshold:
+                                global_idx = idxs[sub_i]
+                                attrs_scored.append((attr_texts[global_idx], float(v)))
+                        attrs_text = as_list_of_str(attrs_scored, args.confidence_threshold, args.max_per_type)
+                    else:
+                        attrs_text = []
 
                     rec = {"image_id": img_ids[b], "anps": anps_text, "attributes": attrs_text}
                     fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
