@@ -1,6 +1,6 @@
 import torch
 from transformers import CLIPProcessor, CLIPModel
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Set
 from contextlib import nullcontext
 import numpy as np
 from PIL import Image
@@ -18,6 +18,7 @@ class KnowledgeExtractor:
           - Cached ANP text features (one-time)
           - On-device text feature cache for arbitrary prompts
           - One-time global attribute prompt features & ANP->indices map
+          - Optimized deduplication and quality filtering
         """
         self.device = torch.device(device)
         self.clip_model = CLIPModel.from_pretrained(clip_model_name).to(self.device)
@@ -25,48 +26,53 @@ class KnowledgeExtractor:
         self.clip_processor = CLIPProcessor.from_pretrained(clip_model_name)
         self.confidence_threshold = confidence_threshold
 
-        # Predefined ANP templates for better extraction
+        # Prioritized ANP templates - simpler, more natural ones first
         self.anp_templates = [
-            # Direct/Simple
+            # Tier 1: Most natural/direct
             "{}",
             "a {}",
             "an {}",
             "the {}",
             
-            # Photo/Image context
+            # Tier 2: Photo context
+            "photo of {}",
+            "image of {}",
             "a photo of {}",
             "an image of {}",
             "a picture of {}",
-            "photo of {}",
-            "image of {}",
             
-            # Spatial/Contextual
+            # Tier 3: Spatial context
             "{} in the image",
             "{} in the photo",
             "{} in the scene",
-            "a {} here",
             "this {}",
             "this is a {}",
+            "a {} here",
+            
+            # Tier 4: More complex
             "showing a {}",
             "contains a {}",
+            "looking at a {}",
             
-            # Category-specific (your existing ones)
-            "a {} person",
-            "a {} object", 
+            # Tier 5: Category-specific (filtered)
             "a {} scene",
-            "a {} animal",
-            "a {} building",
-            "a {} vehicle",
-            "a {} food",
-            "a {} plant",
-            
-            # Activity/State
+            "a {} object",
             "a {} doing something",
-            "a {} that is",
-            "looking at a {}"
+            "a {} that is"
         ]
 
-        # Common attributes for filtering
+        # Define problematic template-noun combinations to skip
+        self.skip_combinations = {
+            # Cross-category combinations that don't make sense
+            ("person", "food"), ("person", "building"), ("person", "vehicle"),
+            ("food", "person"), ("food", "building"), ("food", "vehicle"), ("food", "animal"),
+            ("building", "person"), ("building", "food"), ("building", "animal"),
+            ("vehicle", "person"), ("vehicle", "food"), ("vehicle", "animal"),
+            ("animal", "food"), ("animal", "building"), ("animal", "vehicle"),
+            ("object", "person"), ("scene", "person")
+        }
+
+        # Enhanced attributes
         self.emotional_attributes = [
             # Basic emotions
             "happy", "sad", "angry", "surprised", "confused", "excited", 
@@ -77,6 +83,7 @@ class KnowledgeExtractor:
             "peaceful", "anxious", "nervous", "confident", "shy", "bold",
             "serious", "playful", "mysterious", "friendly", "hostile"
         ]
+        
         self.stylistic_attributes = [
             # Visual properties
             "bright", "dark", "colorful", "monochrome", "black and white",
@@ -101,6 +108,13 @@ class KnowledgeExtractor:
             "artistic", "creative", "professional", "amateur"
         ]
         
+        # Physical/descriptive attributes
+        self.physical_attributes = [
+            "tall", "short", "wide", "narrow", "thick", "thin", "heavy", "light",
+            "round", "square", "rectangular", "circular", "curved", "straight",
+            "soft", "hard", "flexible", "rigid", "transparent", "opaque",
+            "metallic", "wooden", "plastic", "glass", "fabric", "leather"
+        ]
         
         # ===== Text caches =====
         self._cached_anp_strings: Optional[List[str]] = None
@@ -122,8 +136,98 @@ class KnowledgeExtractor:
             if self.device.type == "cuda" else nullcontext()
         )
 
+    def _should_skip_combination(self, template: str, noun: str) -> bool:
+        """Check if template-noun combination should be skipped."""
+        # Extract category keywords from template
+        template_categories = []
+        if "person" in template:
+            template_categories.append("person")
+        if "food" in template:
+            template_categories.append("food")
+        if "building" in template:
+            template_categories.append("building")
+        if "vehicle" in template:
+            template_categories.append("vehicle")
+        if "animal" in template:
+            template_categories.append("animal")
+        if "object" in template:
+            template_categories.append("object")
+        if "scene" in template:
+            template_categories.append("scene")
+        
+        # Check noun category
+        noun_category = self._get_noun_category(noun)
+        
+        # Skip if any template category conflicts with noun category
+        for template_cat in template_categories:
+            if (template_cat, noun_category) in self.skip_combinations:
+                return True
+        return False
+
+    def _get_noun_category(self, noun: str) -> str:
+        """Categorize nouns to help filter combinations."""
+        people_nouns = {"person", "man", "woman", "child", "baby", "boy", "girl", "adult", 
+                       "teenager", "individual", "human"}
+        food_nouns = {"food", "pizza", "burger", "sandwich", "cake", "bread", "fruit", 
+                     "apple", "banana", "orange", "vegetable", "salad", "meat", "chicken", 
+                     "fish", "drink", "coffee", "tea", "water", "wine", "beer", "meal"}
+        building_nouns = {"house", "building", "office", "school", "hospital", "church", 
+                         "store", "restaurant", "hotel", "bridge", "tower", "castle"}
+        vehicle_nouns = {"car", "truck", "bike", "bicycle", "motorcycle", "bus", "train", 
+                        "plane", "airplane", "helicopter", "boat", "ship", "vehicle", "scooter", "van"}
+        animal_nouns = {"dog", "cat", "bird", "fish", "horse", "cow", "pig", "sheep", 
+                       "chicken", "elephant", "lion", "tiger", "bear", "monkey", "rabbit", 
+                       "deer", "wolf", "animal", "pet", "wildlife", "insect", "butterfly", "bee"}
+        
+        if noun in people_nouns:
+            return "person"
+        elif noun in food_nouns:
+            return "food"
+        elif noun in building_nouns:
+            return "building"
+        elif noun in vehicle_nouns:
+            return "vehicle"
+        elif noun in animal_nouns:
+            return "animal"
+        else:
+            return "object"
+
+    def _deduplicate_similar_anps(self, anps: List[str], max_results: int = 15) -> List[str]:
+        """Remove very similar ANPs to reduce redundancy while preserving diversity."""
+        if not anps:
+            return anps
+            
+        result = []
+        seen_roots = set()
+        
+        # First pass: include diverse root concepts
+        for anp in anps:
+            # Extract the main noun (usually the last meaningful word)
+            words = anp.split()
+            root = words[-1] if words else anp
+            
+            # Skip very common words that don't help with uniqueness
+            if root in {"is", "a", "an", "the", "of", "in", "at", "here", "that", "something"}:
+                root = words[-2] if len(words) > 1 else root
+                
+            if root not in seen_roots:
+                result.append(anp)
+                seen_roots.add(root)
+                if len(result) >= max_results:
+                    break
+        
+        # Second pass: fill remaining slots with high-quality variations
+        if len(result) < max_results:
+            for anp in anps:
+                if anp not in result and len(result) < max_results:
+                    # Prefer simpler, more direct forms
+                    if any(simple in anp for simple in ["photo of", "image of", "a ", "the "]):
+                        result.append(anp)
+        
+        return result
+
     def _generate_anp_candidates(self) -> List[str]:
-        """Generate candidate ANPs using templates and common nouns."""
+        """Generate candidate ANPs using templates and common nouns with filtering."""
         candidates = []
         common_nouns = [
             # People
@@ -162,16 +266,20 @@ class KnowledgeExtractor:
             
             # Clothing/Accessories
             "shirt", "pants", "dress", "shoes", "hat", "jacket", "coat", "glasses",
-            "watch", "jewelry", "ring", "necklace", "bag", "purse", "clothes",
+            "watch", "jewelry", "ring", "necklace", "purse", "clothes",
             
             # Abstract/General
             "object", "thing", "item", "stuff", "material", "surface", "shape",
             "color", "pattern", "texture", "design", "art", "artwork", "painting",
             "sign", "text", "number", "letter", "symbol", "logo", "brand"
         ]
+        
         for template in self.anp_templates:
             for noun in common_nouns:
-                candidates.append(template.format(noun))
+                # Skip problematic combinations
+                if not self._should_skip_combination(template, noun):
+                    candidates.append(template.format(noun))
+        
         return candidates
 
     def _encode_texts_to_device_tensor(self, texts: List[str], chunk: int = 512) -> torch.Tensor:
@@ -212,7 +320,7 @@ class KnowledgeExtractor:
         if self._attr_all_text_features is not None:
             return
         self._ensure_cached_anp_text_features()
-        attrs = self.emotional_attributes + self.stylistic_attributes
+        attrs = self.emotional_attributes + self.stylistic_attributes + self.physical_attributes
 
         all_texts: List[str] = []
         anp_to_indices: Dict[str, List[int]] = {}
@@ -260,7 +368,7 @@ class KnowledgeExtractor:
 
     # ---------- Public APIs ----------
 
-    def extract_anps_with_clip(self, image, max_anps=10) -> List[Tuple[str, float]]:
+    def extract_anps_with_clip(self, image, max_anps=15) -> List[Tuple[str, float]]:
         """Rank ANP candidates against image and return top with scores."""
         if torch.is_tensor(image):
             image = self._tensor_to_pil(image)
@@ -278,13 +386,30 @@ class KnowledgeExtractor:
         img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
         sim = (img_feat @ text_features.T).squeeze(0)  # [N]
 
-        k = min(max_anps, sim.numel())
+        # Get more candidates initially for deduplication
+        k = min(max_anps * 3, sim.numel())
         vals, idxs = torch.topk(sim, k=k, largest=True)
-        out = []
+        
+        # Filter by confidence and collect candidates
+        candidates_with_scores = []
         for i, v in zip(idxs.tolist(), vals.tolist()):
             if v >= self.confidence_threshold:
-                out.append((candidate_anps[i], float(v)))
-        return out
+                candidates_with_scores.append((candidate_anps[i], float(v)))
+        
+        # Extract just the ANP strings for deduplication
+        candidate_anps_only = [anp for anp, score in candidates_with_scores]
+        
+        # Deduplicate while preserving order and diversity
+        deduplicated_anps = self._deduplicate_similar_anps(candidate_anps_only, max_anps)
+        
+        # Reconstruct final results with scores
+        anp_to_score = {anp: score for anp, score in candidates_with_scores}
+        result = []
+        for anp in deduplicated_anps:
+            if anp in anp_to_score:
+                result.append((anp, anp_to_score[anp]))
+        
+        return result
 
     def extract_attributes(self, image, anps: List[str], top_k: int = 20) -> List[Tuple[str, float]]:
         """

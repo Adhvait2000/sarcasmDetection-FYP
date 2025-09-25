@@ -34,6 +34,43 @@ def as_list_of_str(
             seen.add(t); uniq.append(t)
     return uniq[:max_per_type]
 
+def deduplicate_similar_anps(anps: List[str], max_results: int = 15) -> List[str]:
+    """
+    Remove very similar ANPs to reduce redundancy while preserving diversity.
+    This is a standalone version of the method from KnowledgeExtractor.
+    """
+    if not anps:
+        return anps
+        
+    result = []
+    seen_roots = set()
+    
+    # First pass: include diverse root concepts
+    for anp in anps:
+        # Extract the main noun (usually the last meaningful word)
+        words = anp.split()
+        root = words[-1] if words else anp
+        
+        # Skip very common words that don't help with uniqueness
+        if root in {"is", "a", "an", "the", "of", "in", "at", "here", "that", "something"}:
+            root = words[-2] if len(words) > 1 else root
+            
+        if root not in seen_roots:
+            result.append(anp)
+            seen_roots.add(root)
+            if len(result) >= max_results:
+                break
+    
+    # Second pass: fill remaining slots with high-quality variations
+    if len(result) < max_results:
+        for anp in anps:
+            if anp not in result and len(result) < max_results:
+                # Prefer simpler, more direct forms
+                if any(simple in anp for simple in ["photo of", "image of", "a ", "the "]):
+                    result.append(anp)
+    
+    return result
+
 def load_image_rgb(p: Path):
     with Image.open(p) as im:
         return im.convert("RGB")
@@ -61,7 +98,7 @@ def main():
     ap.add_argument("--raw_image_root", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--confidence_threshold", type=float, default=0.7)
-    ap.add_argument("--max_per_type", type=int, default=30)
+    ap.add_argument("--max_per_type", type=int, default=15)  # Reduced default
     ap.add_argument("--limit", type=int, default=0, help="debug: process only first N")
     ap.add_argument("--batch_size", type=int, default=32, help="image batch size for CLIP")
     args = ap.parse_args()
@@ -127,15 +164,18 @@ def main():
             # 3) Per image: rank ANPs, then gather attribute rows and rank
             for b in range(img_feats.size(0)):
                 try:
-                    # ANPs
+                    # ANPs - get more candidates for deduplication
                     anps_scored = rank_anps_for_features(
                         image_feat=img_feats[b],
                         candidate_anps=candidate_anps,
                         anp_text_features=anp_text_features,
                         confidence_threshold=args.confidence_threshold,
-                        max_return=args.max_per_type * 2,  # overselect then filter
+                        max_return=args.max_per_type * 3,  # Get 3x for deduplication
                     )
-                    anps_text = as_list_of_str(anps_scored, args.confidence_threshold, args.max_per_type)
+                    
+                    # Extract ANP strings and deduplicate
+                    anp_strings = [anp for anp, score in anps_scored]
+                    anps_text = deduplicate_similar_anps(anp_strings, args.max_per_type)
 
                     # Attributes: gather rows for these ANPs
                     idxs: List[int] = []
