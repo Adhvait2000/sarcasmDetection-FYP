@@ -274,6 +274,10 @@ class EnhancedTrainer:
         val_img_file = self.parameter.get("val_img_file", "val_B32.pt")
         test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
 
+        cache_dir = self.parameter.get("cache_dir", None)
+        anp_cache = os.path.join(cache_dir, "anp_attr_all.jsonl")
+        cap_cache = os.path.join(cache_dir, "captions_all.jsonl")
+
         # Datasets
         train_dataset = EnhancedBaseSet(
             type="train",
@@ -281,6 +285,8 @@ class EnhancedTrainer:
             text_path=os.path.join(self.parameter["annotation_files"], "train.json"),
             img_path=os.path.join(self.parameter["DATA_DIR"], train_img_file),
             knowledge_types=knowledge_types,
+            anp_attr_cache_path=anp_cache,
+            caption_cache_path=cap_cache,   
             max_knowledge_length=self.parameter.get("know_max_length", 20),
             dataset_percentage=dataset_percentage,
         )
