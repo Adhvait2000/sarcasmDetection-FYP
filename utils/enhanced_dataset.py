@@ -39,7 +39,6 @@ class EnhancedBaseSet(Dataset):
         
         # Initialize knowledge extractor and filter
         self.knowledge_extractor = KnowledgeExtractor(confidence_threshold=confidence_threshold)
-        self.knowledge_filter = KnowledgeFilter(confidence_threshold, frequency_threshold)
         
         # Load dataset
         with open(self.text_path) as f:
@@ -103,8 +102,7 @@ class EnhancedBaseSet(Dataset):
         def _filter_and_trim(pairs, max_len):
             if not pairs:
                 return []
-            filtered = self.knowledge_filter.filter_knowledge(pairs)
-            return [k for k, conf in filtered][:max_len]
+            return [k for k, conf in pairs][:max_len]
 
         extracted_knowledge = {}
 
