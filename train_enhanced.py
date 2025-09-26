@@ -240,7 +240,7 @@ class EnhancedTrainer:
     
     def _get_knowledge_types(self):
         if self.model_type == "baseline":
-            return [1]  # captions
+            return []  # tweets
         elif self.model_type in ["image_only", "text_image"]:
             return []
         elif self.model_type == "knowledge_only":
