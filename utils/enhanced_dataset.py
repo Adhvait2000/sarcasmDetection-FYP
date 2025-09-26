@@ -9,24 +9,31 @@ from typing import List, Dict, Tuple, Optional
 from utils.knowledge_extractor import KnowledgeExtractor
 import numpy as np
 
+import os
+import json
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from typing import List, Dict, Tuple, Optional
+
 class EnhancedBaseSet(Dataset):
-    def __init__(self, type="train", max_length=100, text_path=None, use_np=False, 
-                 img_path=None, knowledge_types=[0], max_knowledge_length=20,
-                 confidence_threshold=0.7, frequency_threshold=2, dataset_percentage=100.0):
+    def __init__(
+        self,
+        type: str = "train",
+        max_length: int = 100,
+        text_path: Optional[str] = None,
+        use_np: bool = False,
+        img_path: Optional[str] = None,
+        knowledge_types: List[int] = [0],
+        max_knowledge_length: int = 20,
+        dataset_percentage: float = 1.0,       # PROPORTION (1.0 = 100%)
+        anp_attr_cache_path: Optional[str] = "/caches/anp_attr_all.jsonl",  
+        caption_cache_path: Optional[str] = "/caches/captions_all.jsonl",  
+    ):
         """
-        Enhanced dataset class supporting multiple knowledge types
-        
-        Args:
-            type: "train","val","test"
-            max_length: the max_length for bert embedding
-            text_path: path to annotation file
-            img_path: path to img embedding
-            use_np: whether use noun phrase as relation matching node
-            knowledge_types: List of types [0=no knowledge, 1=caption, 2=ANP, 3=attribute, 4=hybrid]
-            max_knowledge_length: max tokens per knowledge channel
-            confidence_threshold: minimum confidence for knowledge acceptance
-            frequency_threshold: minimum frequency for knowledge acceptance
-            dataset_percentage: proportion of dataset to use (1.0 = 100%)
+        Enhanced dataset class supporting multiple knowledge types from cached files
+
+        knowledge_types: [0=no knowledge, 1=caption, 2=ANP, 3=attribute, 4=hybrid]
         """
         self.type = type
         self.max_length = max_length
@@ -35,31 +42,51 @@ class EnhancedBaseSet(Dataset):
         self.use_np = use_np
         self.knowledge_types = knowledge_types
         self.max_knowledge_length = max_knowledge_length
-        self.dataset_percentage = dataset_percentage
-        
-        # Initialize knowledge extractor and filter
-        self.knowledge_extractor = KnowledgeExtractor(confidence_threshold=confidence_threshold)
-        
+        self.dataset_percentage = float(dataset_percentage)
+
         # Load dataset
-        with open(self.text_path) as f:
+        with open(self.text_path, "r") as f:
             self.full_dataset = json.load(f)
         self.full_img_set = torch.load(self.img_path)
-        
+
+        # Load cached knowledge files
+        self.anp_attr_cache = self._load_jsonl_cache(anp_attr_cache_path)
+        self.caption_cache = self._load_jsonl_cache(caption_cache_path)
+
         # Apply dataset sampling
         self.dataset, self.img_set = self._sample_dataset()
-        print(f"Dataset sampling: Using {len(self.dataset)} samples ({self.dataset_percentage*100:.1f}% of {len(self.full_dataset)} total samples)")
-        
-        # Pre-extract knowledge if needed
-        self.extracted_knowledge = self._pre_extract_knowledge()
+        print(
+            f"Dataset sampling: Using {len(self.dataset)} samples "
+            f"({self.dataset_percentage * 100:.1f}% of {len(self.full_dataset)} total samples)"
+        )
+
+        # Pre-extract knowledge from cache
+        self.extracted_knowledge = self._pre_extract_knowledge_from_cache()
+
+    def _load_jsonl_cache(self, cache_path: Optional[str]) -> Dict[str, dict]:
+        """Load JSONL cache file into a dictionary keyed by image_id (as str)."""
+        cache_dict: Dict[str, dict] = {}
+        if cache_path and os.path.exists(cache_path):
+            with open(cache_path, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    iid = str(entry.get("image_id", "")).strip()
+                    if not iid:
+                        continue
+                    cache_dict[iid] = entry
+        else:
+            if cache_path:
+                print(f"Warning: Cache file {cache_path} not found")
+        return cache_dict
 
     def _sample_dataset(self) -> Tuple[List, torch.Tensor]:
         """
-        Sample a percentage of the dataset
-
+        Sample a percentage of the dataset (class-balanced).
         Returns:
             Tuple of (sampled_dataset, sampled_img_set)
         """
-        total_samples = len(self.full_dataset)
         if self.dataset_percentage >= 1.0:
             return self.full_dataset, self.full_img_set
 
@@ -69,72 +96,65 @@ class EnhancedBaseSet(Dataset):
         sampled_dataset = []
         sampled_img_set = []
 
-        # Seed once for reproducibility
         np.random.seed(42)
         for label in unique_labels:
             label_indices = [i for i, l in enumerate(labels) if l == label]
-            # ensure >=1 per label when possible; cap at available
-            label_target = max(1, int(len(label_indices) * self.dataset_percentage))
-            label_target = min(label_target, len(label_indices))
-            if label_target == 0:
+            target = max(1, int(len(label_indices) * self.dataset_percentage))
+            target = min(target, len(label_indices))
+            if target == 0:
                 continue
-            selected_indices = np.random.choice(label_indices, size=label_target, replace=False)
+            selected_indices = np.random.choice(label_indices, size=target, replace=False)
             for idx in selected_indices:
                 sampled_dataset.append(self.full_dataset[idx])
                 sampled_img_set.append(self.full_img_set[idx])
 
         combined = list(zip(sampled_dataset, sampled_img_set))
         if not combined:
-            # fallback: use entire dataset to avoid zip(*) error
             return self.full_dataset, self.full_img_set
 
         np.random.shuffle(combined)
         sampled_dataset, sampled_img_set = zip(*combined)
         return list(sampled_dataset), torch.stack(sampled_img_set)
 
-
-    def _pre_extract_knowledge(self) -> Dict[int, Dict]:
+    def _pre_extract_knowledge_from_cache(self) -> Dict[int, Dict]:
         """
-        Pre-extract knowledge for all samples to avoid repeated computation.
-        Extract both ANPs and attributes first (using raw ANPs as optional context),
-        then filter and trim each stream independently.
+        Extract knowledge from cached JSONL files for all samples.
+        Maps dataset entries to cached knowledge by image_id.
         """
-        def _filter_and_trim(pairs, max_len):
-            if not pairs:
+        def _dedup_trim(seq, k):
+            if not seq:
                 return []
-            return [k for k, conf in pairs][:max_len]
+            # order-preserving de-dup
+            seen, out = set(), []
+            for x in seq:
+                if x not in seen:
+                    seen.add(x); out.append(x)
+                if len(out) >= k:
+                    break
+            return out
 
-        extracted_knowledge = {}
+        extracted_knowledge: Dict[int, Dict] = {}
 
-        for idx, _ in enumerate(self.dataset):
-            knowledge_dict = {}
+        for idx, sample in enumerate(self.dataset):
+            kd = {"anps": [], "attributes": [], "caption": []}
 
-            # Only extract if ANY knowledge type needs it
-            needs_anps = 2 in self.knowledge_types or 4 in self.knowledge_types
-            needs_attrs = 3 in self.knowledge_types or 4 in self.knowledge_types
-            
-            if needs_anps or needs_attrs:
-                img = self.img_set[idx]
-                
-                # Extract ANPs ONCE if needed
-                anps_with_conf = []
-                if needs_anps:
-                    anps_with_conf = self.knowledge_extractor.extract_anps_with_clip(img)
-                
-                # Extract attributes (using raw ANPs for context if available)
-                attrs_with_conf = []
-                if needs_attrs:
-                    raw_anp_terms = [a for a, c in anps_with_conf] if anps_with_conf else []
-                    attrs_with_conf = self.knowledge_extractor.extract_attributes(img, raw_anp_terms)
-                
-                # Filter and trim
-                knowledge_dict['anps'] = _filter_and_trim(anps_with_conf, self.max_knowledge_length) if needs_anps else []
-                knowledge_dict['attributes'] = _filter_and_trim(attrs_with_conf, self.max_knowledge_length) if needs_attrs else []
-            else:
-                knowledge_dict['anps'] = []
-                knowledge_dict['attributes'] = []
-                
-            extracted_knowledge[idx] = knowledge_dict
+            # Expect sample[0] to be image_id; fallback to index if not present
+            image_id = str(sample[0]) if len(sample) > 0 else str(idx)
+
+            # ANPs/Attributes
+            cached_aa = self.anp_attr_cache.get(image_id, {})
+            if 2 in self.knowledge_types:
+                kd["anps"] = _dedup_trim(cached_aa.get("anps", []), self.max_knowledge_length)
+            if 3 in self.knowledge_types:
+                kd["attributes"] = _dedup_trim(cached_aa.get("attributes", []), self.max_knowledge_length)
+
+            # Captions
+            cached_cap = self.caption_cache.get(image_id, {})
+            if 1 in self.knowledge_types:
+                cap_text = str(cached_cap.get("caption", "")).strip()
+                kd["caption"] = cap_text.split()[: self.max_knowledge_length]
+
+            extracted_knowledge[idx] = kd
 
         return extracted_knowledge
 
@@ -160,23 +180,18 @@ class EnhancedBaseSet(Dataset):
         # Build knowledge data based on requested types
         knowledge_data = None
         if any(k > 0 for k in self.knowledge_types):
-            kd = {}
             ex = self.extracted_knowledge.get(index, {})
+            kd = {}
 
-            # Captions (pseudo-caption from text, trimmed)
             if 1 in self.knowledge_types:
-                kd["caption"] = twitter[: self.max_knowledge_length]
-
+                kd["caption"] = ex.get("caption", [])
             if 2 in self.knowledge_types:
                 kd["anps"] = ex.get("anps", [])
-
             if 3 in self.knowledge_types:
                 kd["attributes"] = ex.get("attributes", [])
-
             if 4 in self.knowledge_types:
-                # Hybrid: Combine ANPs and attributes (deduplicated, order-preserving)
-                seen = set()
-                hybrid = []
+                # Hybrid: ANPs + Attributes (order-preserving de-dup)
+                seen, hybrid = set(), []
                 for item in ex.get("anps", []):
                     if item not in seen:
                         seen.add(item); hybrid.append(item)
@@ -184,19 +199,15 @@ class EnhancedBaseSet(Dataset):
                     if item not in seen:
                         seen.add(item); hybrid.append(item)
                 kd["hybrid"] = hybrid[: self.max_knowledge_length]
-            
+
             if kd:
                 knowledge_data = kd
 
-        # Return with or without knowledge
-        if knowledge_data is None:
-            return img, twitter, dep, label
-        else:
-            return img, twitter, dep, label, knowledge_data
+        return (img, twitter, dep, label) if knowledge_data is None else (img, twitter, dep, label, knowledge_data)
 
     def __len__(self):
-        """Returns length of the dataset"""
         return len(self.dataset)
+
 
 class MultiKnowledgePadCollate:
     def __init__(self, img_dim=0, twitter_dim=1, dep_dim=2, label_dim=3, 
