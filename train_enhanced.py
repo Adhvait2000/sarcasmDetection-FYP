@@ -274,9 +274,18 @@ class EnhancedTrainer:
         val_img_file = self.parameter.get("val_img_file", "val_B32.pt")
         test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
 
-        cache_dir = self.parameter.get("cache_dir", None)
+        cache_dir = self.parameter.get("cache_dir")
         anp_cache = os.path.join(cache_dir, "anp_attr_all.jsonl")
         cap_cache = os.path.join(cache_dir, "captions_all.jsonl")
+
+        def _assert_file(p, label):
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"{label} not found at: {p}")
+            return p
+
+        anp_cache = _assert_file(anp_cache, "ANP/Attr cache")
+        cap_cache = _assert_file(cap_cache, "Captions cache")
+
 
         # Datasets
         train_dataset = EnhancedBaseSet(
@@ -297,6 +306,8 @@ class EnhancedTrainer:
             text_path=os.path.join(self.parameter["annotation_files"], "val.json"),
             img_path=os.path.join(self.parameter["DATA_DIR"], val_img_file),
             knowledge_types=knowledge_types,
+            anp_attr_cache_path=anp_cache,
+            caption_cache_path=cap_cache, 
             max_knowledge_length=self.parameter.get("know_max_length", 20),
             dataset_percentage=1.0,
         )
@@ -307,6 +318,8 @@ class EnhancedTrainer:
             text_path=os.path.join(self.parameter["annotation_files"], "test.json"),
             img_path=os.path.join(self.parameter["DATA_DIR"], test_img_file),
             knowledge_types=knowledge_types,
+            anp_attr_cache_path=anp_cache,
+            caption_cache_path=cap_cache, 
             max_knowledge_length=self.parameter.get("know_max_length", 20),
             dataset_percentage=1.0,
         )

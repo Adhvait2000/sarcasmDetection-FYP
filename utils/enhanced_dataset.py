@@ -63,23 +63,22 @@ class EnhancedBaseSet(Dataset):
         # Pre-extract knowledge from cache
         self.extracted_knowledge = self._pre_extract_knowledge_from_cache()
 
-    def _load_jsonl_cache(self, cache_path: Optional[str]) -> Dict[str, dict]:
-        """Load JSONL cache file into a dictionary keyed by image_id (as str)."""
-        cache_dict: Dict[str, dict] = {}
-        if cache_path and os.path.exists(cache_path):
-            with open(cache_path, "r") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line)
-                    iid = str(entry.get("image_id", "")).strip()
-                    if not iid:
-                        continue
-                    cache_dict[iid] = entry
-        else:
-            if cache_path:
-                print(f"Warning: Cache file {cache_path} not found")
+    def _load_jsonl_cache(self, cache_path):
+        """Load JSONL cache file into a dictionary keyed by image_id"""
+        cache_dict = {}
+        if not cache_path or not os.path.exists(cache_path):
+            raise FileNotFoundError(f"Cache file not found: {cache_path}")
+        
+        with open(cache_path, "r") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                entry = json.loads(line.strip())
+                image_id = str(entry.get("image_id", "")).strip()
+                if image_id:
+                    cache_dict[image_id] = entry
         return cache_dict
+
 
     def _sample_dataset(self) -> Tuple[List, torch.Tensor]:
         """

@@ -5,7 +5,7 @@
     "annotation_files": "/Users/adhvaitsrinath/Desktop/sarcasm/twitter/dataset_text",
     "model_name": "Enhanced_KEHM",
 
-    "cache_dir": "/Users/adhvaitsrinath/Documents/GitHub/sarcasmDetection-FYP/caches",
+    "cache_dir": "/content/project/caches",
     
     "patience": 3,
     "batch_size": 32,
