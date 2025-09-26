@@ -53,6 +53,10 @@ class EnhancedBaseSet(Dataset):
         self.anp_attr_cache = self._load_jsonl_cache(anp_attr_cache_path)
         self.caption_cache = self._load_jsonl_cache(caption_cache_path)
 
+        print(f"[Cache OK] ANP/Attr cache: {anp_attr_cache_path}  -> {len(self.anp_attr_cache)} ids")
+        print(f"[Cache OK] Captions cache: {caption_cache_path}   -> {len(self.caption_cache)} ids")
+
+
         # Apply dataset sampling
         self.dataset, self.img_set = self._sample_dataset()
         print(
@@ -119,11 +123,11 @@ class EnhancedBaseSet(Dataset):
         """
         Extract knowledge from cached JSONL files for all samples.
         Maps dataset entries to cached knowledge by image_id.
+        Also prints coverage stats so you know caches are actually being used.
         """
         def _dedup_trim(seq, k):
             if not seq:
                 return []
-            # order-preserving de-dup
             seen, out = set(), []
             for x in seq:
                 if x not in seen:
@@ -134,14 +138,26 @@ class EnhancedBaseSet(Dataset):
 
         extracted_knowledge: Dict[int, Dict] = {}
 
+        total = len(self.dataset)
+        anp_attr_hits = 0
+        caption_hits  = 0
+        missing_anp_attr_ids = []
+        missing_caption_ids  = []
+
         for idx, sample in enumerate(self.dataset):
             kd = {"anps": [], "attributes": [], "caption": []}
-
-            # Expect sample[0] to be image_id; fallback to index if not present
             image_id = str(sample[0]) if len(sample) > 0 else str(idx)
 
             # ANPs/Attributes
             cached_aa = self.anp_attr_cache.get(image_id, {})
+            if cached_aa:
+                anp_attr_hits += 1
+            else:
+                # Track only if we actually requested 2 or 3
+                if 2 in self.knowledge_types or 3 in self.knowledge_types:
+                    if len(missing_anp_attr_ids) < 5:
+                        missing_anp_attr_ids.append(image_id)
+
             if 2 in self.knowledge_types:
                 kd["anps"] = _dedup_trim(cached_aa.get("anps", []), self.max_knowledge_length)
             if 3 in self.knowledge_types:
@@ -149,13 +165,34 @@ class EnhancedBaseSet(Dataset):
 
             # Captions
             cached_cap = self.caption_cache.get(image_id, {})
+            if cached_cap:
+                caption_hits += 1
+            else:
+                if 1 in self.knowledge_types and len(missing_caption_ids) < 5:
+                    missing_caption_ids.append(image_id)
+
             if 1 in self.knowledge_types:
                 cap_text = str(cached_cap.get("caption", "")).strip()
                 kd["caption"] = cap_text.split()[: self.max_knowledge_length]
 
             extracted_knowledge[idx] = kd
 
+        # Coverage summary
+        def _pct(x, y): 
+            return 0.0 if y == 0 else (100.0 * x / y)
+
+        if 2 in self.knowledge_types or 3 in self.knowledge_types:
+            print(f"[Cache usage • {self.type}] ANP/Attr coverage: {anp_attr_hits}/{total} ({_pct(anp_attr_hits,total):.1f}%)")
+            if anp_attr_hits < total and missing_anp_attr_ids:
+                print(f"[Cache usage • {self.type}] Example missing image_ids (ANP/Attr): {missing_anp_attr_ids}")
+
+        if 1 in self.knowledge_types:
+            print(f"[Cache usage • {self.type}] Caption coverage:   {caption_hits}/{total} ({_pct(caption_hits,total):.1f}%)")
+            if caption_hits < total and missing_caption_ids:
+                print(f"[Cache usage • {self.type}] Example missing image_ids (Caption): {missing_caption_ids}")
+
         return extracted_knowledge
+
 
     def __getitem__(self, index):
         """
