@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 import json
 from typing import List, Dict, Tuple, Optional
-from utils.knowledge_extractor import KnowledgeExtractor, KnowledgeFilter
+from utils.knowledge_extractor import KnowledgeExtractor
 import numpy as np
 
 class EnhancedBaseSet(Dataset):
