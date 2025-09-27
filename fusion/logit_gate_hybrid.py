@@ -4,9 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from images.image_models import ImageEncoder
-from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAttention
+from text.multi_knowledge_models import EnhancedTextEncoder
 from interraction.inter_models import CroModality
-from model_enhanced import Alignment  
+from model_enhanced import Alignment, pool_tokens_to_words_batch
+from fusion.logit_gate_knowledge import KnowledgeOnlyLogitGateModel
 
 
 class LogitGateFusion(nn.Module):
@@ -25,19 +26,26 @@ class LogitGateFusion(nn.Module):
     def forward(self, logits_a: torch.Tensor, logits_b: torch.Tensor) -> torch.Tensor:
         # logits_a, logits_b: [B, C]
         x = torch.cat([logits_a, logits_b], dim=-1)  # [B, 2C]
-        alpha = self.gate(x)                          # [B, C]
+        alpha = self.gate(x)                         # [B, C]
         return alpha * logits_a + (1.0 - alpha) * logits_b
 
 
 class HybridLogitGateModel(nn.Module):
     """
-    Hybrid variant identical to your HybridModel except final fusion uses LogitGateFusion.
+    Full hybrid:
+      - Branch A: Text + Image → logits_ti
+      - Branch B: (Tweets + Captions/ANP/Attr) with per-type gating (KnowledgeOnlyLogitGateModel) → logits_k
+      - Final: Logit-gated fusion between logits_ti and logits_k
     """
-    def __init__(self, txt_input_dim=768, txt_out_size=300, img_input_dim=768,
-                 img_inter_dim=500, img_out_dim=300, knowledge_types=[1, 2, 3],
-                 max_knowledge_length=20, cro_layers=6, cro_heads=5, cro_drop=0.5,
-                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, img_gat_layer=2,
-                 img_gat_drop=0.5, img_gat_head=2, img_patch=49, lam=1, type_bmco=1):
+    def __init__(self,
+                 txt_input_dim=768, txt_out_size=300,
+                 img_input_dim=768, img_inter_dim=500, img_out_dim=300,
+                 knowledge_types=(1, 2, 3),  # [CAP, ANP, ATTR]
+                 max_knowledge_length=20,
+                 cro_layers=6, cro_heads=5, cro_drop=0.5,
+                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2,
+                 img_gat_layer=2, img_gat_drop=0.5, img_gat_head=2,
+                 img_patch=49, lam=1, type_bmco=1):
         super().__init__()
 
         # store
@@ -45,8 +53,8 @@ class HybridLogitGateModel(nn.Module):
         self.txt_out_size = txt_out_size
         self.img_input_dim = img_input_dim
         self.img_inter_dim = img_inter_dim
-        self.img_out_dim = img_out_dim
-        self.knowledge_types = knowledge_types
+        self.img_out_dim = img_out_dim if img_out_dim == txt_out_size else txt_out_size
+        self.knowledge_types = list(knowledge_types)
         self.max_knowledge_length = max_knowledge_length
         self.cro_layers = cro_layers
         self.cro_heads = cro_heads
@@ -61,15 +69,12 @@ class HybridLogitGateModel(nn.Module):
         self.lam = lam
         self.type_bmco = type_bmco
 
-        if self.img_out_dim != self.txt_out_size:
-            self.img_out_dim = self.txt_out_size
-
-        # encoders
+        # --- Branch A: text + image encoders & interaction (same as your original) ---
         self.txt_encoder = EnhancedTextEncoder(
             input_size=self.txt_input_dim,
             output_size=self.txt_out_size,
-            knowledge_types=self.knowledge_types,
-            max_knowledge_length=self.max_knowledge_length,
+            knowledge_types=[],  # no external knowledge in this branch
+            max_knowledge_length=0,
             dropout=self.cro_drop
         )
         self.img_encoder = ImageEncoder(
@@ -77,8 +82,6 @@ class HybridLogitGateModel(nn.Module):
             inter_dim=self.img_inter_dim,
             output_dim=self.img_out_dim
         )
-
-        # interaction
         self.interaction = CroModality(
             input_size=self.img_out_dim,
             nhead=self.cro_heads,
@@ -87,14 +90,6 @@ class HybridLogitGateModel(nn.Module):
             cro_layer=self.cro_layers,
             type_bmco=self.type_bmco
         )
-
-        # knowledge fusion + aligners
-        self.knowledge_fusion = WeightedKnowledgeAttention(
-            input_size=self.txt_out_size,
-            num_heads=self.cro_heads,
-            dropout=self.cro_drop
-        )
-
         self.text_image_alignment = Alignment(
             input_size=self.img_out_dim,
             txt_gat_layer=self.txt_gat_layer,
@@ -105,65 +100,67 @@ class HybridLogitGateModel(nn.Module):
             img_gat_head=self.img_gat_head,
             lam=self.lam
         )
+        # tiny head to map alignment summary to logits
+        self.text_image_output = nn.Linear(2 * self.img_patch, 2)
 
-        self.knowledge_alignment = Alignment(
-            input_size=self.txt_out_size,
+        # --- Branch B: knowledge with per-type gating (your existing model) ---
+        self.knowledge_branch = KnowledgeOnlyLogitGateModel(
+            txt_input_dim=self.txt_input_dim,
+            txt_out_size=self.txt_out_size,
+            knowledge_types=self.knowledge_types,
+            max_knowledge_length=self.max_knowledge_length,
+            cro_layers=self.cro_layers,
+            cro_heads=self.cro_heads,
+            cro_drop=self.cro_drop,
             txt_gat_layer=self.txt_gat_layer,
             txt_gat_drop=self.txt_gat_drop,
             txt_gat_head=self.txt_gat_head,
             lam=self.lam
         )
 
-        # heads that output logits for each branch
-        self.text_image_output = nn.Linear(2 * self.img_patch, 2)
-        self.knowledge_head = nn.Linear(2, 2)
-
-        # gated fusion
+        # --- Final modality gate ---
         self.fusion = LogitGateFusion(num_classes=2)
 
-    @staticmethod
-    def _pool_tokens_to_words(seq, score, word_spans, pad_len):
-        from model_enhanced import pool_tokens_to_words_batch
-        return pool_tokens_to_words_batch(seq, score, word_spans, pad_len)
+        # Optional: per-branch temperature (can be tuned 0.8–1.5)
+        self.register_buffer("temp_ti", torch.tensor(1.0))
+        self.register_buffer("temp_k", torch.tensor(1.0))
 
-    def forward(self, imgs, texts, mask_batch, img_edge_index, t1_word_seq,
-                txt_edge_index, gnn_mask, np_mask, knowledge_inputs, knowledge_masks):
+    def _pool_tokens_to_words(self, seq, score, word_spans, pad_len):
+        return pool_tokens_to_words_batch(seq=seq, score=score, word_spans=word_spans, pad_len=pad_len)
 
-        # image branch
-        v2, pv = self.img_encoder(imgs, lam=self.lam)
+    def forward(self, imgs, texts, mask_batch, img_edge_index,
+                t1_word_seq, txt_edge_index, gnn_mask, np_mask,
+                knowledge_inputs=None, knowledge_masks=None):
 
-        # text + knowledge tokens
-        t_tok, t_scores_tok, k_type_emb, _k_scores = self.txt_encoder(
+        device = imgs.device
+
+        # Ensure graph edges live on the same device (prevents CUDA/CPU mismatch)
+        if isinstance(txt_edge_index, torch.Tensor):
+            txt_edge_index = txt_edge_index.to(device)
+        if isinstance(img_edge_index, torch.Tensor):
+            img_edge_index = img_edge_index.to(device)
+
+        # ===== Branch A: Text + Image → logits_ti =====
+        # Image encoder
+        v2, pv = self.img_encoder(imgs, lam=self.lam)  # v2: [B, P, D], pv: [B, P]
+
+        # Text encoder (no external knowledge in this branch)
+        t_tok, t_scores_tok, _k_type_emb_unused, _k_scores_unused = self.txt_encoder(
             text_input=texts,
-            knowledge_inputs=knowledge_inputs,
-            knowledge_masks=knowledge_masks,
+            knowledge_inputs=None,
+            knowledge_masks=None,
             lam=self.lam
         )
 
-        # cross-modal interaction
+        # Cross-modal interaction
         v2, t_tok = self.interaction(images=v2, texts=t_tok, key_padding_mask=mask_batch)
 
-        # tokens -> words for text-image alignment
+        # Tokens → words (for alignment)
         t_word, t_scores_word = self._pool_tokens_to_words(
             seq=t_tok, score=t_scores_tok, word_spans=t1_word_seq, pad_len=mask_batch.size(1)
         )
 
-        # knowledge attention
-        fused_text_tok, fused_k_type, _ = self.knowledge_fusion(
-            text_embeddings=t_tok,
-            knowledge_embeddings=k_type_emb,
-            knowledge_masks=knowledge_masks
-        )
-
-        # tokens -> words for knowledge alignment
-        fused_text_word, fused_text_word_scores = self._pool_tokens_to_words(
-            seq=fused_text_tok, score=t_scores_tok, word_spans=t1_word_seq, pad_len=mask_batch.size(1)
-        )
-
-        B = fused_k_type.size(0)
-        dummy_img_ei = torch.zeros((B, 2, 0), dtype=torch.long, device=fused_k_type.device)
-
-        # align
+        # Text–Image alignment summary: shape [B, 2 * img_patch]
         ti_align = self.text_image_alignment(
             t2=t_word, v2=v2,
             edge_index=txt_edge_index, gnn_mask=gnn_mask,
@@ -171,26 +168,24 @@ class HybridLogitGateModel(nn.Module):
             img_edge_index=img_edge_index, lam=self.lam
         )
 
-        know_align = self.knowledge_alignment(
-            t2=fused_text_word, v2=fused_k_type,
-            edge_index=txt_edge_index, gnn_mask=gnn_mask,
-            score=fused_text_word_scores, key_padding_mask=mask_batch, np_mask=np_mask,
-            img_edge_index=dummy_img_ei, lam=self.lam
-        )
+        # (Optional) use pv as a soft attention prior; keep your original trick
+        pv_scaled = torch.softmax(pv, dim=1).repeat(1, 2)  # [B, 2*Kimg]
+        logits_ti = self.text_image_output(ti_align * pv_scaled)  # [B, 2]
 
-        # heads → logits
-        pv = torch.softmax(pv, dim=1).repeat(1, 2)  # [B, 2Kimg]
-        logits_ti = self.text_image_output(ti_align * pv)  # [B,2]
+        # ===== Branch B: Knowledge with per-type gating → logits_k =====
+        # This re-encodes text internally (acceptable duplication, simplest integration)
+        logits_k = self.knowledge_branch(
+            texts=texts, mask_batch=mask_batch,
+            t1_word_seq=t1_word_seq, txt_edge_index=txt_edge_index,
+            gnn_mask=gnn_mask, np_mask=np_mask,
+            knowledge_inputs=knowledge_inputs, knowledge_masks=knowledge_masks
+        )  # [B, 2]
 
-        B_, twoK = know_align.shape
-        if twoK == 0:
-            pooled_know = torch.zeros(B_, 2, device=know_align.device, dtype=know_align.dtype)
-        else:
-            K = twoK // 2
-            a1 = know_align[:, :K]
-            a2 = know_align[:, K:]
-            pooled_know = F.adaptive_avg_pool1d(torch.stack([a1, a2], dim=1), 1).squeeze(-1)  # [B,2]
-        logits_k = self.knowledge_head(pooled_know)  # [B,2]
+        # ===== Final gated fusion between branches =====
+        # Optional temperature calibration
+        if self.temp_ti.item() != 1.0:
+            logits_ti = logits_ti / self.temp_ti
+        if self.temp_k.item() != 1.0:
+            logits_k = logits_k / self.temp_k
 
-        # gated late fusion on logits
         return self.fusion(logits_ti, logits_k)

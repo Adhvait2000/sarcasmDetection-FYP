@@ -341,7 +341,6 @@ class KnowledgeOnlyModel(nn.Module):
         predictions = self.classifier(pooled)               # [B, 2]
         return predictions
 
-
 class HybridModel(nn.Module):
     """
     Hybrid Model: Image + Text + Captions + ANPs + Attributes

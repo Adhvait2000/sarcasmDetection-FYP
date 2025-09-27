@@ -24,6 +24,7 @@ from utils.enhanced_dataset import EnhancedBaseSet, MultiKnowledgePadCollate
 from utils.data_utils import construct_edge_image, seed_everything
 from utils.compute_scores import get_metrics, get_four_metrics
 from fusion.logit_gate_knowledge import KnowledgeOnlyLogitGateModel
+from fusion.logit_gate_hybrid import HybridLogitGateModel
 
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -214,8 +215,8 @@ class EnhancedTrainer:
                 txt_gat_head=self.parameter["txt_gat_head"],
                 lam=self.parameter["lambda"]
             )
-        elif self.model_type == "hybrid":
-            return HybridModel(
+        elif self.model_type == "knowledge_hybrid":
+            return HybridLogitGateModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
                 txt_out_size=self.parameter["txt_out_size"],
                 img_input_dim=self.parameter["img_input_dim"],
@@ -256,7 +257,7 @@ class EnhancedTrainer:
             return [1, 2]          # CAP + ANP
         elif self.model_type == "caption_attr":
             return [1, 3]          # CAP + ATTR
-        elif self.model_type == "hybrid":
+        elif self.model_type == "knowledge_hybrid":
             return [1, 2, 3]        # CAP + ANP + ATTR
 
 
@@ -755,7 +756,7 @@ class EnhancedTrainer:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', type=str, default='baseline',
-                       choices=['baseline','knowledge_only','hybrid','image_only','text_image',
+                       choices=['baseline','knowledge_only','knowledge_hybrid','image_only','text_image',
          'knowledge_only_anp','knowledge_only_attr','caption_anp','caption_attr', 'caption_only'],
                        help='Model type to train')
     parser.add_argument('--parameter_file', type=str, default='parameter.json',
