@@ -108,6 +108,7 @@ class EnhancedTrainer:
         "knowledge_only",
         "knowledge_only_anp",
         "knowledge_only_attr",
+        "caption_only",
         "caption_anp",
         "caption_attr",
         }  
@@ -198,7 +199,7 @@ class EnhancedTrainer:
                 type_bmco=self.parameter["type_bmco"]
             )
         elif self.model_type in ["knowledge_only", "knowledge_only_anp", 
-                           "knowledge_only_attr", "caption_anp", "caption_attr"]:
+                           "knowledge_only_attr", "caption_anp", "caption_attr", "caption_only"]:
             # All knowledge ablations use the logit gate model
             return KnowledgeOnlyLogitGateModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
@@ -245,6 +246,8 @@ class EnhancedTrainer:
             return []
         elif self.model_type == "knowledge_only":
             return [2, 3]          # ANP + ATTR
+        elif self.model_type == "caption_only":
+            return [1]          # CAP only
         elif self.model_type == "knowledge_only_anp":
             return [2]             # ANP only
         elif self.model_type == "knowledge_only_attr":
@@ -750,7 +753,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_type', type=str, default='baseline',
                        choices=['baseline','knowledge_only','hybrid','image_only','text_image',
-         'knowledge_only_anp','knowledge_only_attr','caption_anp','caption_attr'],
+         'knowledge_only_anp','knowledge_only_attr','caption_anp','caption_attr', 'caption_only'],
                        help='Model type to train')
     parser.add_argument('--parameter_file', type=str, default='parameter.json',
                        help='Path to parameter file')
