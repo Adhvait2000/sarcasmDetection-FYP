@@ -286,8 +286,11 @@ class EnhancedTrainer:
                 raise FileNotFoundError(f"{label} not found at: {p}")
             return p
 
-        anp_cache = _assert_file(anp_cache, "ANP/Attr cache")
-        cap_cache = _assert_file(cap_cache, "Captions cache")
+        need_anp = (2 in knowledge_types) or (3 in knowledge_types)
+        need_cap = (1 in knowledge_types)
+        
+        anp_cache = _assert_file(anp_cache, "ANP/Attr cache") if need_anp else None
+        cap_cache = _assert_file(cap_cache, "Captions cache") if need_cap else None
 
 
         # Datasets
