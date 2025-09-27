@@ -49,12 +49,21 @@ class EnhancedBaseSet(Dataset):
             self.full_dataset = json.load(f)
         self.full_img_set = torch.load(self.img_path)
 
-        # Load cached knowledge files
-        self.anp_attr_cache = self._load_jsonl_cache(anp_attr_cache_path)
-        self.caption_cache = self._load_jsonl_cache(caption_cache_path)
+        need_anp = any(t in self.knowledge_types for t in (2, 3, 4))  # ANP, ATTR, or hybrid
+        need_cap = (1 in self.knowledge_types)                         # captions
 
-        print(f"[Cache OK] ANP/Attr cache: {anp_attr_cache_path}  -> {len(self.anp_attr_cache)} ids")
-        print(f"[Cache OK] Captions cache: {caption_cache_path}   -> {len(self.caption_cache)} ids")
+        self.anp_attr_cache = self._load_jsonl_cache(anp_attr_cache_path) if need_anp else {}
+        self.caption_cache  = self._load_jsonl_cache(caption_cache_path)  if need_cap else {}
+
+        if need_anp:
+            print(f"[Cache OK] ANP/Attr cache: {anp_attr_cache_path}  -> {len(self.anp_attr_cache)} ids")
+        else:
+            print("[Cache SKIP] ANP/Attr cache not requested by knowledge_types")
+
+        if need_cap:
+            print(f"[Cache OK] Captions cache: {caption_cache_path}   -> {len(self.caption_cache)} ids")
+        else:
+            print("[Cache SKIP] Captions cache not requested by knowledge_types")
 
 
         # Apply dataset sampling
@@ -69,10 +78,12 @@ class EnhancedBaseSet(Dataset):
 
     def _load_jsonl_cache(self, cache_path):
         """Load JSONL cache file into a dictionary keyed by image_id"""
-        cache_dict = {}
-        if not cache_path or not os.path.exists(cache_path):
+        if not cache_path:   # handles None or empty string
+            return {}
+        if not os.path.exists(cache_path):
             raise FileNotFoundError(f"Cache file not found: {cache_path}")
-        
+
+        cache_dict = {}
         with open(cache_path, "r") as f:
             for line in f:
                 if not line.strip():
@@ -82,6 +93,7 @@ class EnhancedBaseSet(Dataset):
                 if image_id:
                     cache_dict[image_id] = entry
         return cache_dict
+
 
 
     def _sample_dataset(self) -> Tuple[List, torch.Tensor]:
