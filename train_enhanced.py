@@ -112,6 +112,7 @@ class EnhancedTrainer:
         "caption_only",
         "caption_anp",
         "caption_attr",
+        "knowledge_hybrid"
         }  
 
     def _make_criterion(self):
@@ -200,7 +201,7 @@ class EnhancedTrainer:
                 type_bmco=self.parameter["type_bmco"]
             )
         elif self.model_type in ["knowledge_only", "knowledge_only_anp", 
-                           "knowledge_only_attr", "caption_anp", "caption_attr", "caption_only"]:
+                           "knowledge_only_attr", "caption_anp", "caption_attr", "caption_only", "knowledge_hybrid"]:
             # All knowledge ablations use the logit gate model
             return KnowledgeOnlyLogitGateModel(
                 txt_input_dim=self.parameter["txt_input_dim"],
@@ -215,28 +216,28 @@ class EnhancedTrainer:
                 txt_gat_head=self.parameter["txt_gat_head"],
                 lam=self.parameter["lambda"]
             )
-        elif self.model_type == "knowledge_hybrid":
-            return HybridLogitGateModel(
-                txt_input_dim=self.parameter["txt_input_dim"],
-                txt_out_size=self.parameter["txt_out_size"],
-                img_input_dim=self.parameter["img_input_dim"],
-                img_inter_dim=self.parameter["img_inter_dim"],
-                img_out_dim=self.parameter["img_out_dim"],
-                knowledge_types=[1, 2, 3],  # Captions, ANP, attributes
-                max_knowledge_length=self.parameter.get("know_max_length", 20),
-                cro_layers=self.parameter["cro_layers"],
-                cro_heads=self.parameter["cro_heads"],
-                cro_drop=self.parameter["cro_drop"],
-                txt_gat_layer=self.parameter["txt_gat_layer"],
-                txt_gat_drop=self.parameter["txt_gat_drop"],
-                txt_gat_head=self.parameter["txt_gat_head"],
-                img_gat_layer=self.parameter["img_gat_layer"],
-                img_gat_drop=self.parameter["img_gat_drop"],
-                img_gat_head=self.parameter["img_gat_head"],
-                img_patch=self.parameter["img_patch"],
-                lam=self.parameter["lambda"],
-                type_bmco=self.parameter["type_bmco"]
-            )
+        # elif self.model_type == "hybrid":
+        #     return HybridLogitGateModel(
+        #         txt_input_dim=self.parameter["txt_input_dim"],
+        #         txt_out_size=self.parameter["txt_out_size"],
+        #         img_input_dim=self.parameter["img_input_dim"],
+        #         img_inter_dim=self.parameter["img_inter_dim"],
+        #         img_out_dim=self.parameter["img_out_dim"],
+        #         knowledge_types=[1, 2, 3],  # Captions, ANP, attributes
+        #         max_knowledge_length=self.parameter.get("know_max_length", 20),
+        #         cro_layers=self.parameter["cro_layers"],
+        #         cro_heads=self.parameter["cro_heads"],
+        #         cro_drop=self.parameter["cro_drop"],
+        #         txt_gat_layer=self.parameter["txt_gat_layer"],
+        #         txt_gat_drop=self.parameter["txt_gat_drop"],
+        #         txt_gat_head=self.parameter["txt_gat_head"],
+        #         img_gat_layer=self.parameter["img_gat_layer"],
+        #         img_gat_drop=self.parameter["img_gat_drop"],
+        #         img_gat_head=self.parameter["img_gat_head"],
+        #         img_patch=self.parameter["img_patch"],
+        #         lam=self.parameter["lambda"],
+        #         type_bmco=self.parameter["type_bmco"]
+        #     )
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
     
