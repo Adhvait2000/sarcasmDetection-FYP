@@ -1,5 +1,7 @@
 # train_late_sum.py  (now supports both late_sum & logit_gate)
 import argparse
+import os
+import json
 from train_enhanced import EnhancedTrainer
 from fusion.late_sum_hybrid import HybridLateSumModel
 from fusion.logit_gate_hybrid import HybridLogitGateModel
@@ -12,6 +14,10 @@ class FusionAblationTrainer(EnhancedTrainer):
         super().__init__(model_type=model_type, parameter_file=parameter_file)
 
         self.logger = Logger(f"logs/{model_type}_{fusion}_training")
+
+    def _fusion_suffix(self):
+        return f"_{self._fusion_variant}" if getattr(self, "_fusion_variant", None) else ""
+
 
     def _initialize_model(self):
         # For non-hybrid, use your original mapping
@@ -49,6 +55,42 @@ class FusionAblationTrainer(EnhancedTrainer):
             return HybridAttnWeightedModel(**common_kwargs)   
         else:
             raise ValueError(f"Unknown fusion variant: {self._fusion_variant}")
+        
+    # --- override filenames for checkpoints ---
+    def save_model(self, epoch, metrics, save_dir="saved_models"):
+        os.makedirs(save_dir, exist_ok=True)
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'metrics': metrics,
+            'model_type': self.model_type,
+            'parameter': self.parameter
+        }
+        path = f"{save_dir}/{self.model_type}{self._fusion_suffix()}_epoch_{epoch}.pt"
+        import torch
+        torch.save(checkpoint, path)
+        return path
+    
+     # --- ensure confusion matrix filename includes fusion ---
+    def plot_confusion_matrix(self, cm, save_path):
+        # inject fusion suffix into whatever path parent passes
+        root, ext = os.path.splitext(save_path)
+        fused_path = f"{root}{self._fusion_suffix()}{ext}"
+        return super().plot_confusion_matrix(cm, fused_path)
+    
+    # --- after training, also emit a fusion-suffixed results file ---
+    def train(self, num_epochs):
+        results = super().train(num_epochs)
+
+        # Write an extra results file with fusion suffix to avoid collisions
+        results_file = f"results_{self.model_type}{self._fusion_suffix()}.json"
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"[Info] Also saved fusion-specific results to: {results_file}")
+
+        return results
 
 def main():
     parser = argparse.ArgumentParser()
