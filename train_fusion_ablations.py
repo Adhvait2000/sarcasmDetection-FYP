@@ -4,11 +4,14 @@ from train_enhanced import EnhancedTrainer
 from fusion.late_sum_hybrid import HybridLateSumModel
 from fusion.logit_gate_hybrid import HybridLogitGateModel
 from fusion.attn_weighted_hybrid import HybridAttnWeightedModel
+from utils.logging.tf_logger import SimpleLogger as Logger
 
 class FusionAblationTrainer(EnhancedTrainer):
     def __init__(self, model_type="hybrid", parameter_file="parameter.json", fusion="late_sum"):
         self._fusion_variant = fusion
         super().__init__(model_type=model_type, parameter_file=parameter_file)
+
+        self.logger = Logger(f"logs/{model_type}_{fusion}_training")
 
     def _initialize_model(self):
         # For non-hybrid, use your original mapping
