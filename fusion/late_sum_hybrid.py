@@ -176,14 +176,15 @@ class HybridLateSumModel(nn.Module):
 
         # Pool knowledge maps to [B,2], then map to logits
         B_, twoK = know_align.shape
-        if twoK == 0:
+        if twoK % 2 != 0:
+            # safety: unexpected shape -> treat as no-knowledge
             pooled_know_2 = torch.zeros(B_, 2, device=know_align.device, dtype=know_align.dtype)
         else:
             K = twoK // 2
-            a1 = know_align[:, :K]   # [B,K]
-            a2 = know_align[:, K:]   # [B,K]
-            stacked = torch.stack([a1, a2], dim=1)              # [B,2,K]
+            a1, a2 = know_align[:, :K], know_align[:, K:]
+            stacked = torch.stack([a1, a2], dim=1)           # [B, 2, K]
             pooled_know_2 = F.adaptive_avg_pool1d(stacked, 1).squeeze(-1)  # [B,2]
+
 
         logits_k = self.knowledge_head(pooled_know_2)  # [B,2]
 
