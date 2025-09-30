@@ -16,6 +16,7 @@
     "weight_decay": 0.005,
     "lr": 2e-5,
     "head_lr": 1e-4,
+    "label_smoothing": 0.05,
     
     "txt_input_dim": 768,
     "txt_out_size": 256,
@@ -23,7 +24,7 @@
     "img_inter_dim": 500,
     "img_out_dim": 256,
     
-    "cro_layers": 6,
+    "cro_layers": 8,
     "cro_heads": 6,
     "cro_drop": 0.4,
     
