@@ -132,7 +132,7 @@ class HybridAttnWeightedModel(nn.Module):
         v2, pv = self.img_encoder(imgs, lam=self.lam)
 
         # text + knowledge tokens
-        t_tok, t_scores_tok, k_type_emb, _k_scores = self.txt_encoder(
+        t_tok, t_scores_tok, k_type_emb, k_type_scores = self.txt_encoder(
             text_input=texts,
             knowledge_inputs=knowledge_inputs,
             knowledge_masks=knowledge_masks,
@@ -151,7 +151,8 @@ class HybridAttnWeightedModel(nn.Module):
         fused_text_tok, fused_k_type, _ = self.knowledge_fusion(
             text_embeddings=t_tok,
             knowledge_embeddings=k_type_emb,
-            knowledge_masks=knowledge_masks
+            knowledge_masks=knowledge_masks,
+            knowledge_scores=k_type_scores     # <— FIXED: pass the actual scores from encoder
         )
 
         # tokens -> words for knowledge alignment

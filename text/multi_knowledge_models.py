@@ -270,126 +270,118 @@ class EnhancedTextEncoder(nn.Module):
 
 class WeightedKnowledgeAttention(nn.Module):
     def __init__(self, input_size=768, num_heads=8, dropout=0.1, num_knowledge_types=3):
-        """
-        Weighted attention mechanism for knowledge integration
-        
-        Args:
-            input_size: Input dimension size
-            num_heads: Number of attention heads
-            dropout: Dropout rate
-            num_knowledge_types: Number of knowledge types to handle
-        """
-        super(WeightedKnowledgeAttention, self).__init__()
-        
+        super().__init__()
         self.input_size = input_size
         self.num_heads = num_heads
         self.num_knowledge_types = num_knowledge_types
-        
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=input_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Knowledge type weighting
-        self.knowledge_weights = nn.Parameter(torch.ones(num_knowledge_types))
-        self.knowledge_softmax = nn.Softmax(dim=0)
-        
-        # Output projection
-        self.output_projection = nn.Sequential(
-            nn.Linear(input_size, input_size),
-            nn.LayerNorm(input_size),
-            nn.Dropout(dropout)
+
+        # Cross-attention (text <- knowledge) and (knowledge <- text)
+        self.attention = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads,
+                                               dropout=dropout, batch_first=True)
+
+        # GLOBAL priors (learned, like your current param) — optional but helpful
+        self.global_type_logit = nn.Parameter(torch.zeros(num_knowledge_types))
+
+        # NEW: per-sample gating network over per-type knowledge, conditioned on pooled text
+        self.text_pool = nn.AdaptiveAvgPool1d(1)  # simple [B,L,D] -> [B,D]
+        self.type_gate = nn.Sequential(
+            nn.Linear(2*input_size, input_size//2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_size//2, 1)           # scalar score per type
         )
 
-    def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None):
+        # Output projections + residual norms
+        self.out_proj_text = nn.Sequential(
+            nn.Linear(input_size, input_size), nn.Dropout(dropout)
+        )
+        self.out_proj_know = nn.Sequential(
+            nn.Linear(input_size, input_size), nn.Dropout(dropout)
+        )
+        self.ln_text = nn.LayerNorm(input_size)
+        self.ln_know = nn.LayerNorm(input_size)
+
+    def _per_type_mask(self, knowledge_masks, B, K, device):
+        # Build [B,K] mask (True=ignore) from optional list/tensor
+        if knowledge_masks is None:
+            return torch.zeros(B, K, dtype=torch.bool, device=device)
+        if isinstance(knowledge_masks, list):
+            cols = []
+            for m in knowledge_masks:
+                if m is None:
+                    cols.append(torch.ones(B, 1, dtype=torch.bool, device=device))
+                else:
+                    mb = m.to(device)
+                    if mb.dim() == 3 and mb.size(-1) == 1:  # [B,L,1] -> [B,L]
+                        mb = mb.squeeze(-1)
+                    all_pad = mb.bool().all(dim=1, keepdim=True)  # [B,1]
+                    cols.append(all_pad)
+            kp = torch.cat(cols, dim=1)  # [B,K]
+            return kp[:, :K] if kp.size(1) >= K else torch.cat(
+                [kp, torch.zeros(B, K-kp.size(1), dtype=torch.bool, device=device)], dim=1
+            )
+        if torch.is_tensor(knowledge_masks) and knowledge_masks.dim() == 2:
+            return knowledge_masks.to(device).bool()
+        return torch.zeros(B, K, dtype=torch.bool, device=device)
+
+    def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None,
+                knowledge_scores: torch.Tensor = None):
         """
-        Args:
-            text_embeddings: Tensor of shape [B, L, D]
-            knowledge_embeddings: Tensor of shape [B, K, D]  (one vector per knowledge type)
-            knowledge_masks: Optional list/tensor of masks. If a list, each element is a
-                            per-token mask for a knowledge type shaped [B, L_i] with True at PADs.
-                            We'll collapse it to a per-type mask [B, K] for MultiheadAttention.
-        Returns:
-            attended_text:       [B, L, D]
-            attended_knowledge:  [B, K, D]
-            text_attention:      attention weights from the text<-knowledge attention
+        text_embeddings:   [B, L, D]
+        knowledge_embeddings: [B, K, D]  (one vector per knowledge type)
+        knowledge_masks: list/tensor -> collapsed to [B, K] (True=ignore)
+        knowledge_scores: optional [B, K] confidence (e.g., from upstream scorer or CLIP/BLIP)
         """
         B, L, D = text_embeddings.shape
-        Bk, K, Dk = knowledge_embeddings.shape
-        assert B == Bk and D == Dk, "Batch or embedding dims mismatch between text and knowledge."
+        _, K, Dk = knowledge_embeddings.shape
+        assert D == Dk, "Dim mismatch."
 
-        device = knowledge_embeddings.device
+        device = text_embeddings.device
+        kp_mask = self._per_type_mask(knowledge_masks, B, K, device)  # True=ignore
 
-        # Compute (learned) knowledge-type weights and reweight knowledge embeddings
-        knowledge_type_weights = self.knowledge_softmax(self.knowledge_weights)             # [K]
-        weighted_knowledge = knowledge_embeddings * knowledge_type_weights.view(1, K, 1)   # [B, K, D]
+        # ---- PER-SAMPLE TYPE WEIGHTS ----
+        # Pool text to a single vector per sample
+        t_pool = self.text_pool(text_embeddings.transpose(1, 2)).squeeze(-1)  # [B,D]
 
-        # --- Build a proper key_padding_mask for keys of length K: [B, K] boolean ---
-        # True means "ignore/pad" per PyTorch's MultiheadAttention.
-        def _build_per_type_mask(k_masks, K_expected):
-            if k_masks is None:
-                return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
+        # For each type, score concatenation [t_pool || k_type]
+        t_rep = t_pool.unsqueeze(1).expand(B, K, D)                           # [B,K,D]
+        gate_inp = torch.cat([t_rep, knowledge_embeddings], dim=-1)           # [B,K,2D]
+        type_logits_local = self.type_gate(gate_inp).squeeze(-1)              # [B,K]
 
-            # If a list: each element is a per-token mask [B, L_i] for that type.
-            if isinstance(k_masks, list):
-                per_type = []
-                for m in k_masks:
-                    if m is None:
-                        # No tokens available for this type -> mask it out
-                        per_type.append(torch.ones(B, 1, dtype=torch.bool, device=device))
-                    else:
-                        mb = m.to(device)
-                        if mb.dim() == 3 and mb.size(-1) == 1:
-                            mb = mb.squeeze(-1)  # [B, L_i]
-                        mb = mb.bool()
-                        # If ALL positions are PAD for a sample, this type is absent -> mask=True
-                        all_pad = mb.all(dim=1, keepdim=True)  # [B, 1]
-                        per_type.append(all_pad)
-                kp = torch.cat(per_type, dim=1)  # [B, K_list]
-                # Pad/crop to expected K if needed
-                if kp.size(1) < K_expected:
-                    pad = torch.zeros(B, K_expected - kp.size(1), dtype=torch.bool, device=device)
-                    kp = torch.cat([kp, pad], dim=1)
-                elif kp.size(1) > K_expected:
-                    kp = kp[:, :K_expected]
-                return kp
+        # Add GLOBAL prior and optional external confidence (log-space)
+        logits = type_logits_local + self.global_type_logit.view(1, K)
+        if knowledge_scores is not None:
+            logits = logits + knowledge_scores.to(device)  # expect comparable scale
 
-            # If already a tensor, try to coerce to [B, K]
-            if torch.is_tensor(k_masks):
-                km = k_masks.to(device)
-                if km.dim() == 2 and km.size(0) == B and km.size(1) == K_expected:
-                    return km.bool()
-                # Fallback: no mask if shape is not compatible
-                return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
+        # Masked softmax over K (set -inf where masked)
+        logits = logits.masked_fill(kp_mask, float('-inf'))
+        # Safe softmax: if all -inf (rare), unmask type 0
+        all_inf = torch.isneginf(logits).all(dim=1, keepdim=True)             # [B,1]
+        logits = torch.where(all_inf, torch.zeros_like(logits), logits)
+        per_sample_weights = F.softmax(logits, dim=1)                          # [B,K]
 
-            # Default: no mask
-            return torch.zeros(B, K_expected, dtype=torch.bool, device=device)
+        # Reweight knowledge keys/values
+        weighted_knowledge = knowledge_embeddings * per_sample_weights.unsqueeze(-1)  # [B,K,D]
 
-        kp_mask = _build_per_type_mask(knowledge_masks, K)  # [B, K], True=ignore
-        kp_mask = kp_mask.to(weighted_knowledge.device).bool()
-
-        all_masked = kp_mask.all(dim=1)  # [B]
+        # Ensure at least one key per sample is usable for MHA
+        kp_mask_fix = kp_mask.clone()
+        all_masked = kp_mask_fix.all(dim=1)
         if all_masked.any():
-            fix_idx = all_masked.nonzero(as_tuple=False).squeeze(-1)
-            kp_mask[fix_idx, 0] = False
+            idx = all_masked.nonzero(as_tuple=False).squeeze(-1)
+            kp_mask_fix[idx, 0] = False
 
-        # Cross-attention: text attends to knowledge (keys/values length = K)
-        attended_text, text_attention = self.attention(
-            query=text_embeddings, key=weighted_knowledge, value=weighted_knowledge, key_padding_mask=kp_mask
+        # ---- Attention: text <- knowledge ----
+        att_text, _ = self.attention(
+            query=text_embeddings, key=weighted_knowledge, value=weighted_knowledge,
+            key_padding_mask=kp_mask_fix
         )
-        attended_text = torch.nan_to_num(attended_text, 0.0)              # NEW: nan guard
-        attended_text = torch.clamp(attended_text, -1e4, 1e4)             # NEW: clamp extremes
-        attended_text = self.output_projection(attended_text)              # NEW: actually use projection
+        # Residual + LN
+        text_out = self.ln_text(text_embeddings + self.out_proj_text(torch.nan_to_num(att_text)))
 
-        # Reverse attention: knowledge attends to text
-        attended_knowledge, _ = self.attention(
+        # ---- Reverse: knowledge <- text ----
+        att_know, _ = self.attention(
             query=weighted_knowledge, key=text_embeddings, value=text_embeddings
         )
-        attended_knowledge = torch.nan_to_num(attended_knowledge, 0.0)    # NEW: nan guard
-        attended_knowledge = torch.clamp(attended_knowledge, -1e4, 1e4)   # NEW: clamp extremes
-        attended_knowledge = self.output_projection(attended_knowledge)    # NEW: use projection
+        know_out = self.ln_know(weighted_knowledge + self.out_proj_know(torch.nan_to_num(att_know)))
 
-        return attended_text, attended_knowledge, text_attention
+        return text_out, know_out, per_sample_weights  # weights now per-sample and mask-aware

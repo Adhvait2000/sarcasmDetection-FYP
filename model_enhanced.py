@@ -485,7 +485,9 @@ class HybridModel(nn.Module):
         fused_text, fused_knowledge, attention_weights = self.knowledge_fusion(
             text_embeddings=texts,
             knowledge_embeddings=knowledge_embeddings,
-            knowledge_masks=knowledge_masks
+            knowledge_masks=knowledge_masks,
+            knowledge_scores=knowledge_scores
+
         )
 
         # ▶︎ Pool fused_text to words for knowledge alignment

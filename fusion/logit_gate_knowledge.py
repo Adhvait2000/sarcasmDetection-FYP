@@ -124,7 +124,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
                 np_mask, knowledge_inputs, knowledge_masks):
 
         # Encode tokens
-        t_tok, t_scores_tok, k_type_emb, _k_scores = self.knowledge_encoder(
+        t_tok, t_scores_tok, k_type_emb, k_type_scores = self.knowledge_encoder(
             text_input=texts,
             knowledge_inputs=knowledge_inputs,
             knowledge_masks=knowledge_masks,
@@ -134,8 +134,9 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         # Cross attention to get (i) text contextualized by knowledge, (ii) per-type knowledge reprs
         fused_text_tok, fused_k_type, _ = self.knowledge_fusion(
             text_embeddings=t_tok,               # [B, Lt, D]
-            knowledge_embeddings=k_type_emb,     # [B, K, D] where K=len(knowledge_types)
-            knowledge_masks=knowledge_masks
+            knowledge_embeddings=k_type_emb,     # [B, K, D]
+            knowledge_masks=knowledge_masks,
+            knowledge_scores=k_type_scores       # <— NEW: wire per-type scores
         )
 
         # Tokens -> words for alignment
