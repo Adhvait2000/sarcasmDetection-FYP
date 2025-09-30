@@ -339,29 +339,34 @@ class WeightedKnowledgeAttention(nn.Module):
         device = text_embeddings.device
         kp_mask = self._per_type_mask(knowledge_masks, B, K, device)  # True=ignore
 
-        # ---- PER-SAMPLE TYPE WEIGHTS ----
-        # Pool text to a single vector per sample
-        t_pool = self.text_pool(text_embeddings.transpose(1, 2)).squeeze(-1)  # [B,D]
+        # ---- SPECIAL CASE: single knowledge type ----
+        if K == 1:
+            per_sample_weights = torch.ones(B, 1, device=device)  # fixed weight = 1
+            weighted_knowledge = knowledge_embeddings             # no rescaling
+        else:
+            # ---- PER-SAMPLE TYPE WEIGHTS ----
+            # Pool text to a single vector per sample
+            t_pool = self.text_pool(text_embeddings.transpose(1, 2)).squeeze(-1)  # [B,D]
 
-        # For each type, score concatenation [t_pool || k_type]
-        t_rep = t_pool.unsqueeze(1).expand(B, K, D)                           # [B,K,D]
-        gate_inp = torch.cat([t_rep, knowledge_embeddings], dim=-1)           # [B,K,2D]
-        type_logits_local = self.type_gate(gate_inp).squeeze(-1)              # [B,K]
+            # For each type, score concatenation [t_pool || k_type]
+            t_rep = t_pool.unsqueeze(1).expand(B, K, D)                           # [B,K,D]
+            gate_inp = torch.cat([t_rep, knowledge_embeddings], dim=-1)           # [B,K,2D]
+            type_logits_local = self.type_gate(gate_inp).squeeze(-1)              # [B,K]
 
-        # Add GLOBAL prior and optional external confidence (log-space)
-        logits = type_logits_local + self.global_type_logit.view(1, K)
-        if knowledge_scores is not None:
-            logits = logits + knowledge_scores.to(device)  # expect comparable scale
+            # Add GLOBAL prior and optional external confidence
+            logits = type_logits_local + self.global_type_logit.view(1, K)
+            if knowledge_scores is not None:
+                logits = logits + knowledge_scores.to(device)  # expect comparable scale
 
-        # Masked softmax over K (set -inf where masked)
-        logits = logits.masked_fill(kp_mask, float('-inf'))
-        # Safe softmax: if all -inf (rare), unmask type 0
-        all_inf = torch.isneginf(logits).all(dim=1, keepdim=True)             # [B,1]
-        logits = torch.where(all_inf, torch.zeros_like(logits), logits)
-        per_sample_weights = F.softmax(logits, dim=1)                          # [B,K]
+            # Masked softmax over K (set -inf where masked)
+            logits = logits.masked_fill(kp_mask, float('-inf'))
+            # Safe softmax: if all -inf (rare), unmask type 0
+            all_inf = torch.isneginf(logits).all(dim=1, keepdim=True)
+            logits = torch.where(all_inf, torch.zeros_like(logits), logits)
+            per_sample_weights = F.softmax(logits, dim=1)                          # [B,K]
 
-        # Reweight knowledge keys/values
-        weighted_knowledge = knowledge_embeddings * per_sample_weights.unsqueeze(-1)  # [B,K,D]
+            # Reweight knowledge keys/values
+            weighted_knowledge = knowledge_embeddings * per_sample_weights.unsqueeze(-1)  # [B,K,D]
 
         # Ensure at least one key per sample is usable for MHA
         kp_mask_fix = kp_mask.clone()
@@ -384,4 +389,5 @@ class WeightedKnowledgeAttention(nn.Module):
         )
         know_out = self.ln_know(weighted_knowledge + self.out_proj_know(torch.nan_to_num(att_know)))
 
-        return text_out, know_out, per_sample_weights  # weights now per-sample and mask-aware
+        return text_out, know_out, per_sample_weights
+
