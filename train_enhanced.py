@@ -115,6 +115,74 @@ class EnhancedTrainer:
         "knowledge_combined"
         }  
 
+    def _predict_probs_labels(self, data_loader):
+        """Collect p(class=1) and labels from a loader. Tuple-safe for model outputs."""
+        self.model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for batch in tqdm(data_loader, desc="Scoring"):
+                # --- Forward (mirror your evaluate() branching) ---
+                if self.model_type in self.KNOW_ABLATIONS:
+                    texts, mask_batch, word_spans, txt_edge_index, gnn_mask, np_mask, \
+                    knowledge_inputs, knowledge_masks = self._prepare_knowledge_only_batch(batch)
+                    outputs = self.model(
+                        texts=texts, mask_batch=mask_batch, t1_word_seq=word_spans,
+                        txt_edge_index=txt_edge_index, gnn_mask=gnn_mask, np_mask=np_mask,
+                        knowledge_inputs=knowledge_inputs, knowledge_masks=knowledge_masks,
+                    )
+                elif self.model_type == "image_only":
+                    imgs = batch[0].to(device)
+                    outputs = self.model(imgs=imgs)
+                else:
+                    imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
+                    gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
+                    outputs = self.model(
+                        imgs=imgs, texts=texts, mask_batch=mask_batch, img_edge_index=img_edge_index,
+                        t1_word_seq=word_spans, txt_edge_index=txt_edge_index, gnn_mask=gnn_mask,
+                        np_mask=np_mask, knowledge_inputs=knowledge_inputs, knowledge_masks=knowledge_masks,
+                    )
+
+                logits = outputs[0] if isinstance(outputs, tuple) else outputs
+                probs = F.softmax(logits, dim=1)[:, 1]  # p(class=1)
+                all_probs.append(probs.detach().cpu())
+                all_labels.append(batch[8].to(device).long().detach().cpu())
+
+        all_probs = torch.cat(all_probs).numpy()
+        all_labels = torch.cat(all_labels).numpy()
+        return all_labels, all_probs
+
+
+    def _find_best_threshold(self, y_true, y_prob, average="weighted", grid=None):
+        """Grid-search threshold ∈ [0,1] to maximize F1 on val."""
+        import numpy as np
+        from sklearn.metrics import f1_score
+
+        if grid is None:
+            grid = np.linspace(0.05, 0.95, 181)  # 0.05 step
+
+        best_t, best_f1 = 0.5, -1.0
+        for t in grid:
+            y_pred = (y_prob >= t).astype(int)
+            if average == "binary":
+                f1 = f1_score(y_true, y_pred, average="binary", pos_label=1)
+            else:
+                f1 = f1_score(y_true, y_pred, average=average)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        return best_t, best_f1
+
+
+    def _metrics_from_probs(self, y_true, y_prob, threshold, average="weighted"):
+        """Compute metrics at a fixed threshold."""
+        from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+
+        y_pred = (y_prob >= threshold).astype(int)
+        acc = accuracy_score(y_true, y_pred)
+        pr, rc, f1, _ = precision_recall_fscore_support(y_true, y_pred, average=average)
+        cm = confusion_matrix(y_true, y_pred)
+        return {"accuracy": acc, "precision": pr, "recall": rc, "f1": f1, "confusion_matrix": cm}
+
+
     def _make_criterion(self):
         """
         Creates the loss based on parameter.json config.
@@ -752,25 +820,46 @@ class EnhancedTrainer:
             checkpoint = torch.load(best_ckpt_path, map_location=device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"\nLoaded best model from epoch {best_epoch+1}")
-        
-        # Test evaluation
+        else:
+            print("\n[WARN] No best checkpoint recorded; proceeding with current weights.")
+
         print(f"\n{'='*50}")
-        print(f"Testing best model (epoch {best_epoch+1})")
+        print(f"Tuning decision threshold on VAL (maximize F1)")
         print(f"{'='*50}")
-        
-        test_metrics = self.evaluate(test_loader, "test")
-        
-        print(f"\nTest Results:")
+
+        avg_for_f1 = self.parameter.get("threshold_f1_average", "weighted")  # "weighted" or "binary"
+
+        val_y, val_p = self._predict_probs_labels(val_loader)
+        best_t, best_val_f1_tuned = self._find_best_threshold(val_y, val_p, average=avg_for_f1)
+        print(f"Best threshold on VAL: {best_t:.3f}  |  Tuned VAL F1 ({avg_for_f1}): {best_val_f1_tuned:.4f}")
+
+        print(f"\n{'='*50}")
+        print(f"Testing best model at tuned threshold t={best_t:.3f}")
+        print(f"{'='*50}")
+
+        test_y, test_p = self._predict_probs_labels(test_loader)
+        test_metrics = self._metrics_from_probs(test_y, test_p, best_t, average=avg_for_f1)
+
+        print(f"\nTest Results (thresholded at {best_t:.3f}):")
         print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
         print(f"  Precision: {test_metrics['precision']:.4f}")
         print(f"  Recall:    {test_metrics['recall']:.4f}")
         print(f"  F1 Score:  {test_metrics['f1']:.4f}")
-        
-        # Save results
+
+        # Optional: save the thresholded confusion matrix
+        self.plot_confusion_matrix(
+            test_metrics['confusion_matrix'],
+            f"confusion_matrix_{self.model_type}_test_thresholded.png"
+        )
+
+        safe_best_epoch = best_epoch + 1 if best_epoch >= 0 else num_epochs
         results = {
             'model_type': self.model_type,
-            'best_epoch': best_epoch + 1,
-            'best_val_f1': best_val_f1,
+            'best_epoch': safe_best_epoch,
+            'best_val_f1': best_val_f1,               # argmax path you tracked during training
+            'val_best_threshold': float(best_t),
+            'val_f1_tuned': float(best_val_f1_tuned),
+            'threshold_average': avg_for_f1,
             'test_metrics': {
                 'accuracy': float(test_metrics['accuracy']),
                 'precision': float(test_metrics['precision']),
@@ -778,13 +867,10 @@ class EnhancedTrainer:
                 'f1': float(test_metrics['f1'])
             }
         }
-        
         results_file = f"results_{self.model_type}.json"
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
-        
         print(f"\nResults saved to: {results_file}")
-        
         return results
 
 def main():
