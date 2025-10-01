@@ -391,12 +391,11 @@ class EnhancedTrainer:
             return batch_tensor
         
     def train_epoch(self, train_loader):
-
-        """Train for one epoch"""
+        """Train for one epoch (tuple-safe across all model variants)."""
         self.model.train()
         total_loss = 0.0
-        total_ce_loss = 0.0      # NEW: Track CE separately
-        total_entropy_loss = 0.0     # NEW: Track CE separately
+        total_ce_loss = 0.0
+        total_entropy_loss = 0.0
         correct = 0
         total = 0
 
@@ -429,12 +428,6 @@ class EnhancedTrainer:
                     knowledge_masks=knowledge_masks,
                 )
 
-                if isinstance(outputs, tuple) and len(outputs) == 2:
-                    logits, entropy_loss = outputs
-                else:
-                    logits = outputs
-                    entropy_loss = torch.tensor(0.0, device=device)
-
             elif self.model_type == "image_only":
                 imgs = batch[0].to(device)
                 outputs = self.model(imgs=imgs)
@@ -461,11 +454,20 @@ class EnhancedTrainer:
                     knowledge_masks=knowledge_masks,
                 )
 
-            # ---- Loss & backward ----
-            labels = batch[8].to(device)
-            ce_loss = self.criterion(outputs, labels)
+            # ---- Normalize outputs to (logits, entropy_loss) for ALL branches ----
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+                # use 2nd element if it's a tensor, else 0.0
+                entropy_loss = outputs[1] if (len(outputs) > 1 and torch.is_tensor(outputs[1])) \
+                            else torch.tensor(0.0, device=device)
+            else:
+                logits = outputs
+                entropy_loss = torch.tensor(0.0, device=device)
 
-            # NEW: Total loss includes entropy regularization
+            # ---- Loss & backward ----
+            labels = batch[8].to(device).long()  # CE expects Long targets
+
+            ce_loss = self.criterion(logits, labels)
             loss = ce_loss + entropy_loss
 
             self.optimizer.zero_grad()
@@ -480,26 +482,28 @@ class EnhancedTrainer:
             total_loss += loss.item()
             total_ce_loss += ce_loss.item()
             total_entropy_loss += entropy_loss.item()
-            _, predicted = torch.max(outputs.data, 1)
+
+            _, predicted = torch.max(logits.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
             progress_bar.set_postfix({
-            "CE_Loss": f"{ce_loss.item():.4f}",
-            "Ent_Loss": f"{entropy_loss.item():.4f}",  # NEW: Show entropy
-            "Acc": f"{100.0 * correct / max(total,1):.2f}%"
+                "CE_Loss": f"{ce_loss.item():.4f}",
+                "Ent_Loss": f"{entropy_loss.item():.4f}",
+                "Acc": f"{100.0 * correct / max(total,1):.2f}%"
             })
 
         avg_loss = total_loss / max(len(train_loader), 1)
         avg_ce = total_ce_loss / max(len(train_loader), 1)
         avg_ent = total_entropy_loss / max(len(train_loader), 1)
 
-        print(f"  [Train Summary] Total Loss: {avg_loss:.4f} (CE: {avg_ce:.4f}, Entropy: {avg_ent:.4f})")
+        print(f"  [Train Summary] Total: {avg_loss:.4f} (CE: {avg_ce:.4f}, Entropy: {avg_ent:.4f})")
 
         return avg_loss, 100.0 * correct / max(total, 1)
+
     
     def evaluate(self, data_loader, split="val"):
-        """Evaluate model performance"""
+        """Evaluate model performance (tuple-safe; ignores entropy in eval)."""
         self.model.eval()
         total_loss = 0.0
         all_predictions, all_labels = [], []
@@ -521,21 +525,15 @@ class EnhancedTrainer:
                         knowledge_masks=knowledge_masks,
                     )
 
-                    # NEW: Handle tuple (entropy_loss will be 0.0 in eval mode)
-                    if isinstance(outputs, tuple):
-                        logits, _ = outputs  # Discard entropy_loss
-                    else:
-                        logits = outputs
-
                 elif self.model_type == "image_only":
                     imgs = batch[0].to(device)
-                    logits = self.model(imgs=imgs)
+                    outputs = self.model(imgs=imgs)
 
                 else:
                     imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
 
-                    logits = self.model(
+                    outputs = self.model(
                         imgs=imgs,
                         texts=texts,
                         mask_batch=mask_batch,
@@ -548,8 +546,13 @@ class EnhancedTrainer:
                         knowledge_masks=knowledge_masks,
                     )
 
+                # ---- Normalize outputs to logits (ignore entropy in eval) ----
+                if isinstance(outputs, tuple):
+                    logits = outputs[0]
+                else:
+                    logits = outputs
 
-                labels = batch[8].to(device)
+                labels = batch[8].to(device).long()
                 loss = self.criterion(logits, labels)
                 total_loss += loss.item()
 
@@ -572,6 +575,7 @@ class EnhancedTrainer:
             "f1": f1,
             "confusion_matrix": cm,
         }
+
 
     
     def _prepare_batch(self, batch):
