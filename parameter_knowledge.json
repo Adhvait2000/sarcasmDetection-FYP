@@ -4,60 +4,63 @@
     "TARGET_DIR": "/Users/adhvaitsrinath/Desktop/sarcasm/result",
     "annotation_files": "/Users/adhvaitsrinath/Desktop/sarcasm/twitter/dataset_text",
     "model_name": "Enhanced_KEHM",
-
     "cache_dir": "/content/project/caches",
-    
-    "patience": 3,
+  
+    "seed": 42,
     "batch_size": 32,
     "epochs": 10,
+    "patience": 3,
     "max_length": 120,
     "use_np": false,
-    "seed": 42,
-    "weight_decay": 0.005,
-    "lr": 2e-5,
-    "label_smoothing": 0.05,
-    
+  
+    "label_smoothing": 0.1,
+    "weight_decay": 0.01,
+    "lr": 1e-5,                                           
+    "grad_clip": 1.0,
+  
     "txt_input_dim": 768,
     "txt_out_size": 256,
     "img_input_dim": 768,
     "img_inter_dim": 500,
     "img_out_dim": 256,
-    
+  
     "cro_layers": 6,
     "cro_heads": 8,
-    "cro_drop": 0.5,
-    
+    "cro_drop": 0.55,
+  
     "txt_gat_layer": 2,
-    "txt_gat_drop": 0.5,
+    "txt_gat_drop": 0.55,
     "txt_gat_head": 2,
     "txt_self_loops": true,
+  
     "img_gat_layer": 2,
-    "img_gat_drop": 0.5,
+    "img_gat_drop": 0.55,
     "img_gat_head": 2,
     "img_self_loops": true,
     "img_edge_dim": 0,
     "img_patch": 49,
-    
+  
     "lambda": 1,
     "type_bmco": 1,
-    
+  
     "knowledge_type": 4,
-    "know_max_length": 20,
+    "know_max_length": 10,
     "know_gat_layer": 2,
     "know_gat_head": 1,
     "know_cro_layer": 3,
     "know_cro_head": 5,
     "know_cro_type": 0,
+  
+    "gate_tau": 2.0,
+    "gate_eps": 0.05,
+    "entropy_lambda": 0.005,
+    "modal_drop_p": 0.2,
+  
     "visualization": false,
-    
     "dataset_percentage": 100.0,
-    
+  
     "train_img_file": "train_B32.pt",
-    "val_img_file": "val_B32.pt", 
+    "val_img_file": "val_B32.pt",
     "test_img_file": "test_B32.pt"
-    
-}
-
-
-
-
+  }
+  

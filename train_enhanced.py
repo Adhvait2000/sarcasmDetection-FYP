@@ -395,6 +395,8 @@ class EnhancedTrainer:
         """Train for one epoch"""
         self.model.train()
         total_loss = 0.0
+        total_ce_loss = 0.0      # NEW: Track CE separately
+        total_entropy_loss = 0.0     # NEW: Track CE separately
         correct = 0
         total = 0
 
@@ -427,6 +429,12 @@ class EnhancedTrainer:
                     knowledge_masks=knowledge_masks,
                 )
 
+                if isinstance(outputs, tuple) and len(outputs) == 2:
+                    logits, entropy_loss = outputs
+                else:
+                    logits = outputs
+                    entropy_loss = torch.tensor(0.0, device=device)
+
             elif self.model_type == "image_only":
                 imgs = batch[0].to(device)
                 outputs = self.model(imgs=imgs)
@@ -455,28 +463,40 @@ class EnhancedTrainer:
 
             # ---- Loss & backward ----
             labels = batch[8].to(device)
-            loss = self.criterion(outputs, labels)
+            ce_loss = self.criterion(outputs, labels)
+
+            # NEW: Total loss includes entropy regularization
+            loss = ce_loss + entropy_loss
 
             self.optimizer.zero_grad()
             loss.backward()
 
-            max_grad_norm = self.parameter.get("enhanced_model_config", {}).get("max_grad_norm", 1.0)
+            max_grad_norm = self.parameter.get("grad_clip", 1.0)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
 
             self.optimizer.step()
 
             # ---- Stats ----
             total_loss += loss.item()
+            total_ce_loss += ce_loss.item()
+            total_entropy_loss += entropy_loss.item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
             progress_bar.set_postfix({
-                "Loss": f"{loss.item():.4f}",
-                "Acc": f"{100.0 * correct / max(total,1):.2f}%"
+            "CE_Loss": f"{ce_loss.item():.4f}",
+            "Ent_Loss": f"{entropy_loss.item():.4f}",  # NEW: Show entropy
+            "Acc": f"{100.0 * correct / max(total,1):.2f}%"
             })
 
-        return total_loss / max(len(train_loader), 1), 100.0 * correct / max(total, 1)
+        avg_loss = total_loss / max(len(train_loader), 1)
+        avg_ce = total_ce_loss / max(len(train_loader), 1)
+        avg_ent = total_entropy_loss / max(len(train_loader), 1)
+
+        print(f"  [Train Summary] Total Loss: {avg_loss:.4f} (CE: {avg_ce:.4f}, Entropy: {avg_ent:.4f})")
+
+        return avg_loss, 100.0 * correct / max(total, 1)
     
     def evaluate(self, data_loader, split="val"):
         """Evaluate model performance"""
@@ -501,15 +521,21 @@ class EnhancedTrainer:
                         knowledge_masks=knowledge_masks,
                     )
 
+                    # NEW: Handle tuple (entropy_loss will be 0.0 in eval mode)
+                    if isinstance(outputs, tuple):
+                        logits, _ = outputs  # Discard entropy_loss
+                    else:
+                        logits = outputs
+
                 elif self.model_type == "image_only":
                     imgs = batch[0].to(device)
-                    outputs = self.model(imgs=imgs)
+                    logits = self.model(imgs=imgs)
 
                 else:
                     imgs, texts, mask_batch, img_edge_index, word_spans, txt_edge_index, \
                     gnn_mask, np_mask, knowledge_inputs, knowledge_masks = self._prepare_batch(batch)
 
-                    outputs = self.model(
+                    logits = self.model(
                         imgs=imgs,
                         texts=texts,
                         mask_batch=mask_batch,
@@ -522,11 +548,12 @@ class EnhancedTrainer:
                         knowledge_masks=knowledge_masks,
                     )
 
+
                 labels = batch[8].to(device)
-                loss = self.criterion(outputs, labels)
+                loss = self.criterion(logits, labels)
                 total_loss += loss.item()
 
-                _, predicted = torch.max(outputs.data, 1)
+                _, predicted = torch.max(logits.data, 1)
                 all_predictions.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 

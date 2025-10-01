@@ -132,11 +132,11 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         )
 
         # Cross attention to get (i) text contextualized by knowledge, (ii) per-type knowledge reprs
-        fused_text_tok, fused_k_type, _ = self.knowledge_fusion(
-            text_embeddings=t_tok,               # [B, Lt, D]
-            knowledge_embeddings=k_type_emb,     # [B, K, D]
+        fused_text_tok, fused_k_type, _, entropy_loss = self.knowledge_fusion(  # ← CHANGED
+            text_embeddings=t_tok,
+            knowledge_embeddings=k_type_emb,
             knowledge_masks=knowledge_masks,
-            knowledge_scores=k_type_scores       # <— NEW: wire per-type scores
+            knowledge_scores=k_type_scores
         )
 
         # Tokens -> words for alignment
@@ -169,6 +169,6 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
             logits_list.append(logits_k)
 
         if len(logits_list) == 1:
-            return logits_list[0]  # single-type ablation degenerates to its own logits
+            return logits_list[0], entropy_loss   # single-type ablation degenerates to its own logits
 
-        return self.fusion(logits_list)  # gated sum across the selected knowledge types
+        return self.fusion(logits_list), entropy_loss  # gated sum across the selected knowledge types
