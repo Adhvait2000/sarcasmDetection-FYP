@@ -336,79 +336,104 @@ class WeightedKnowledgeAttention(nn.Module):
     def forward(self, text_embeddings, knowledge_embeddings, knowledge_masks=None,
                 knowledge_scores: torch.Tensor = None):
         """
-        text_embeddings:   [B, L, D]
-        knowledge_embeddings: [B, K, D]  (one vector per knowledge type)
-        knowledge_masks: list/tensor -> collapsed to [B, K] (True=ignore)
-        knowledge_scores: optional [B, K] confidence (e.g., from upstream scorer or CLIP/BLIP)
+        Returns:
+            text_out: [B, L, D]
+            know_out: [B, K, D]
+            per_sample_weights: [B, K]
+            entropy_loss: scalar (0 in eval or when K_active<=1)
         """
         B, L, D = text_embeddings.shape
         _, K, Dk = knowledge_embeddings.shape
         assert D == Dk, "Dim mismatch."
-
         device = text_embeddings.device
-        kp_mask = self._per_type_mask(knowledge_masks, B, K, device)  # True=ignore
 
-        # ---- SPECIAL CASE: single knowledge type ----
-        if K == 1:
-            per_sample_weights = torch.ones(B, 1, device=device)  # fixed weight = 1
-            weighted_knowledge = knowledge_embeddings    
-            entropy_loss = torch.tensor(0.0, device=device)         # no rescaling
+        # --- Build per-type mask (True = masked/inactive) ---
+        if knowledge_masks is not None:
+            kp_mask = self._per_type_mask(knowledge_masks, B, K, device)
         else:
-            # ---- PER-SAMPLE TYPE WEIGHTS ----
-            # Pool text to a single vector per sample
-            t_pool = self.text_pool(text_embeddings.transpose(1, 2)).squeeze(-1)  # [B,D]
+            kp_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
 
-            # For each type, score concatenation [t_pool || k_type]
-            t_rep = t_pool.unsqueeze(1).expand(B, K, D)                           # [B,K,D]
-            gate_inp = torch.cat([t_rep, knowledge_embeddings], dim=-1)           # [B,K,2D]
-            type_logits_local = self.type_gate(gate_inp).squeeze(-1)              # [B,K]
+        active = (~kp_mask).float()                # [B, K] 1 = active, 0 = masked
+        K_act = active.sum(dim=1, keepdim=True)    # [B, 1]
+        single_active = (K_act.squeeze(1) <= 1)    # [B] bool
 
-            # Add GLOBAL prior and optional external confidence
-            logits = type_logits_local + self.global_type_logit.view(1, K)
+        entropy_loss = torch.tensor(0.0, device=device)
+
+        if K == 1:
+            # Trivial uniform
+            per_sample_weights = active  # already 1 for the only stream
+            weighted_knowledge = knowledge_embeddings  # * 1
+        else:
+            # ----- Compute logits only once -----
+            t_pool = self.text_pool(text_embeddings.transpose(1, 2)).squeeze(-1)  # [B, D]
+            t_rep = t_pool.unsqueeze(1).expand(B, K, D)                           # [B, K, D]
+            gate_inp = torch.cat([t_rep, knowledge_embeddings], dim=-1)           # [B, K, 2D]
+            type_logits_local = self.type_gate(gate_inp).squeeze(-1)              # [B, K]
+
+            logits = type_logits_local + self.global_type_logit.view(1, K)        # [B, K]
             if knowledge_scores is not None:
-                logits = logits + knowledge_scores.to(device)  # expect comparable scale
+                ks = knowledge_scores.to(device)
+                ks = (ks - ks.mean(dim=1, keepdim=True)) / (ks.std(dim=1, keepdim=True) + 1e-6)
+                logits = logits + ks
 
-            # Masked softmax over K (set -inf where masked)
-            logits = logits.masked_fill(kp_mask, float('-inf'))
-
-            # Safe softmax: if all -inf (rare), unmask type 0
+            # mask out inactive streams
+            neg_inf = torch.finfo(logits.dtype).min
+            logits = logits.masked_fill(kp_mask, neg_inf)
             all_inf = torch.isneginf(logits).all(dim=1, keepdim=True)
             logits = torch.where(all_inf, torch.zeros_like(logits), logits)
 
+            # softmax with temperature
+            w = F.softmax(logits / self.tau, dim=1)                               # [B, K]
 
-            per_sample_weights = F.softmax(logits / self.tau, dim=1)      
-            eps = self.epsilon_floor
-            per_sample_weights = (per_sample_weights + eps) / (1.0 + K * eps)    
-            
-            entropy_loss = torch.tensor(0.0, device=device)
-            if self.training:
-                w_safe = per_sample_weights.clamp(min=1e-8)
-                entropy = -(w_safe * torch.log(w_safe)).sum(dim=1).mean()
-                entropy_loss = -self.entropy_lambda * entropy  # Negative to maximize entropy              # [B,K]
+            # ---- ε-floor over active streams only ----
+            eps = getattr(self, "epsilon_floor", 0.0)
+            if eps > 0:
+                # add eps to active entries only, then renormalize over active mass
+                w = w * active + eps * active
+                w = w / (w.sum(1, keepdim=True) + eps * K_act)
 
-            # Reweight knowledge keys/values
-            weighted_knowledge = knowledge_embeddings * per_sample_weights.unsqueeze(-1)  # [B,K,D]
+            # ---- Per-sample override for K_active <= 1 (fast-path) ----
+            if single_active.any():
+                # set weight exactly uniform over the active stream(s) for those samples
+                w_single = active[single_active]
+                w_single = w_single / w_single.sum(1, keepdim=True).clamp_min(1.0)
+                w = w.clone()
+                w[single_active] = w_single
 
-        # Ensure at least one key per sample is usable for MHA
+            per_sample_weights = w
+
+            # ---- Entropy regularization only when K_active > 1 ----
+            if self.training and getattr(self, "entropy_lambda", 0.0) > 0.0:
+                w_active = per_sample_weights * active
+                w_active = w_active / (w_active.sum(1, keepdim=True) + 1e-8)
+                ent = -(w_active.clamp_min(1e-8) * w_active.clamp_min(1e-8).log()).sum(1)
+                mask_multi = (K_act.squeeze(1) > 1).float()
+                target = torch.log(K_act.squeeze(1).clamp(min=1.0))
+                entropy_loss = self.entropy_lambda * ((ent - target) ** 2 * mask_multi).mean()
+
+            weighted_knowledge = knowledge_embeddings * per_sample_weights.unsqueeze(-1)
+
+        # ===== Cross-attention blocks (same as yours) =====
         kp_mask_fix = kp_mask.clone()
         all_masked = kp_mask_fix.all(dim=1)
         if all_masked.any():
             idx = all_masked.nonzero(as_tuple=False).squeeze(-1)
             kp_mask_fix[idx, 0] = False
 
-        # ---- Attention: text <- knowledge ----
         att_text, _ = self.attention(
             query=text_embeddings, key=weighted_knowledge, value=weighted_knowledge,
             key_padding_mask=kp_mask_fix
         )
-        # Residual + LN
         text_out = self.ln_text(text_embeddings + self.out_proj_text(torch.nan_to_num(att_text)))
 
-        # ---- Reverse: knowledge <- text ----
         att_know, _ = self.attention(
             query=weighted_knowledge, key=text_embeddings, value=text_embeddings
+            # key_padding_mask not needed for text keys
         )
         know_out = self.ln_know(weighted_knowledge + self.out_proj_know(torch.nan_to_num(att_know)))
+
+        # NEW: zero out masked knowledge positions in the output (safer residual)
+        know_out = know_out.masked_fill(kp_mask.unsqueeze(-1), 0.0)
 
         return text_out, know_out, per_sample_weights, entropy_loss
 
