@@ -2,6 +2,7 @@
 Multi-Knowledge Fusion Models
 Implements weighted attention mechanisms for combining captions, ANPs, and attributes
 """
+import numpy as np
 import torch    
 import torch.nn as nn
 import torch.nn.functional as F
@@ -275,6 +276,14 @@ class WeightedKnowledgeAttention(nn.Module):
         self.num_heads = num_heads
         self.num_knowledge_types = num_knowledge_types
 
+        # Temperature and Epsilon
+        self.tau = 2.0              # Start high to flatten weights
+        self.epsilon_floor = 0.05 
+
+
+        self.entropy_lambda = 5e-3  # Conservative weight
+        self.register_buffer("target_entropy", torch.tensor(np.log(num_knowledge_types)))
+        
         # Cross-attention (text <- knowledge) and (knowledge <- text)
         self.attention = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads,
                                                dropout=dropout, batch_first=True)
@@ -342,7 +351,8 @@ class WeightedKnowledgeAttention(nn.Module):
         # ---- SPECIAL CASE: single knowledge type ----
         if K == 1:
             per_sample_weights = torch.ones(B, 1, device=device)  # fixed weight = 1
-            weighted_knowledge = knowledge_embeddings             # no rescaling
+            weighted_knowledge = knowledge_embeddings    
+            entropy_loss = torch.tensor(0.0, device=device)         # no rescaling
         else:
             # ---- PER-SAMPLE TYPE WEIGHTS ----
             # Pool text to a single vector per sample
@@ -360,10 +370,21 @@ class WeightedKnowledgeAttention(nn.Module):
 
             # Masked softmax over K (set -inf where masked)
             logits = logits.masked_fill(kp_mask, float('-inf'))
+
             # Safe softmax: if all -inf (rare), unmask type 0
             all_inf = torch.isneginf(logits).all(dim=1, keepdim=True)
             logits = torch.where(all_inf, torch.zeros_like(logits), logits)
-            per_sample_weights = F.softmax(logits, dim=1)                          # [B,K]
+
+
+            per_sample_weights = F.softmax(logits / self.tau, dim=1)      
+            eps = self.epsilon_floor
+            per_sample_weights = (per_sample_weights + eps) / (1.0 + K * eps)    
+            
+            entropy_loss = torch.tensor(0.0, device=device)
+            if self.training:
+                w_safe = per_sample_weights.clamp(min=1e-8)
+                entropy = -(w_safe * torch.log(w_safe)).sum(dim=1).mean()
+                entropy_loss = -self.entropy_lambda * entropy  # Negative to maximize entropy              # [B,K]
 
             # Reweight knowledge keys/values
             weighted_knowledge = knowledge_embeddings * per_sample_weights.unsqueeze(-1)  # [B,K,D]
@@ -389,5 +410,5 @@ class WeightedKnowledgeAttention(nn.Module):
         )
         know_out = self.ln_know(weighted_knowledge + self.out_proj_know(torch.nan_to_num(att_know)))
 
-        return text_out, know_out, per_sample_weights
+        return text_out, know_out, per_sample_weights, entropy_loss
 
