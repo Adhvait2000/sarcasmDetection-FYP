@@ -44,33 +44,6 @@ class MultiLogitGateFusion(nn.Module):
         fused = (w.unsqueeze(-1) * L).sum(1)                 # [B, C]
         return fused, gate_entropy_loss
 
-    def forward(self, logits_list):
-        # logits_list: length K, each [B,C]
-        K = len(logits_list)
-        assert K == self.num_branches and K > 0, f"expected {self.num_branches} branches, got {K}"
-        B, C = logits_list[0].shape
-
-        x = torch.cat(logits_list, dim=-1)              # [B, K*C]
-        g = self.gate(x).view(B, K, C)                  # [B,K,C]
-
-        tau = self.tau.clamp(min=self.tau_min, max=self.tau_max)
-        if self.use_prior:
-            g = g + self.prior.unsqueeze(0)             # [1,K,C] -> broadcast
-
-        g = g - g.max(dim=1, keepdim=True)[0]           # stabilize
-        g = g / tau
-        g = torch.softmax(g, dim=1)                     # per-class over branches
-        g = torch.nan_to_num(g, nan=0.0)
-
-        stacked = torch.stack(logits_list, dim=1)       # [B,K,C]
-        gated = (g * stacked).sum(dim=1)                # [B,C]
-
-        avg = stacked.mean(dim=1)                       # [B,C]
-        out = (1.0 - self.beta) * gated + self.beta * avg
-
-        self.last_gate_weights = g.detach()
-        return out
-
 
 class KnowledgeOnlyLogitGateModel(nn.Module):
     """
