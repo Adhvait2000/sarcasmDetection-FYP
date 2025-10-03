@@ -8,7 +8,7 @@ from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAt
 from model_enhanced import Alignment, pool_tokens_to_words_batch
 
 class MultiLogitGateFusion(nn.Module):
-    def __init__(self, num_branches, num_classes, tau=2.0, eps=0.0, entropy_lambda=5e-3):
+    def __init__(self, num_branches, num_classes, tau=2.0, eps=0.0, entropy_lambda=0.0):
         super().__init__()
         self.K = num_branches
         self.C = num_classes 
