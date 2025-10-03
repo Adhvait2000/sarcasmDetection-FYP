@@ -7,38 +7,39 @@ from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAt
 from model_enhanced import Alignment, pool_tokens_to_words_batch
 
 class MultiLogitGateFusion(nn.Module):
-    """
-    N-branch, per-class soft mixture of logits with temperature, optional prior,
-    and a small residual blend toward the uniform/average to improve robustness.
-    """
-    def __init__(
-        self,
-        num_branches: int,
-        num_classes: int = 2,
-        tau: float = 1.0,                   # gate temperature (learnable)
-        beta: float = 0.1,                  # residual blend toward average logits
-        use_prior: bool = True,             # add learnable per-branch, per-class bias
-        clamp_tau: tuple = (0.5, 5.0),      # safety clamp for temperature
-    ):
+    def __init__(self, num_branches, num_classes, tau=2.0, eps=0.0, entropy_lambda=5e-3):
         super().__init__()
-        self.num_branches = num_branches
-        self.num_classes = num_classes
+        self.K = num_branches
+        self.C = num_classes
+        self.tau = tau
+        self.eps = eps
+        self.entropy_lambda = entropy_lambda
 
-        self.gate = nn.Sequential(
-            nn.Linear(num_branches * num_classes, num_branches * num_classes),
-            nn.Sigmoid()
-        )
+        # simple, stable gate (no need to be fancy)
+        self.norm = nn.LayerNorm(num_branches)
+        self.gate = nn.Linear(num_branches, num_branches)
 
-        self.tau = nn.Parameter(torch.tensor(float(tau)))
-        self.tau_min, self.tau_max = clamp_tau
+    def forward(self, logits_list):
+        # logits_list: list of [B, C] -> [B, K, C]
+        L = torch.stack(logits_list, dim=1)                  # [B, K, C]
+        B, K, C = L.shape
 
-        self.use_prior = use_prior
-        if use_prior:
-            self.prior = nn.Parameter(torch.zeros(num_branches, num_classes))
+        # gate input: per-branch confidence (detach to avoid shortcuts)
+        g_inp = L.detach().mean(-1)                          # [B, K]
+        g = self.gate(self.norm(g_inp))                      # [B, K]
+        w = F.softmax(g / self.tau, dim=1)                   # [B, K]
 
-        self.beta = nn.Parameter(torch.tensor(float(beta)), requires_grad=False)
+        # entropy regularization (toward uniform = log K)
+        if self.training and self.entropy_lambda > 0.0 and K > 1:
+            p = (w + self.eps) / (1.0 + self.eps * K)        # ε-floor (optional)
+            ent = -(p.clamp_min(1e-8) * p.clamp_min(1e-8).log()).sum(1)  # [B]
+            target = math.log(K)
+            gate_entropy_loss = self.entropy_lambda * ((ent - target) ** 2).mean()
+        else:
+            gate_entropy_loss = L.new_zeros(())
 
-        self.last_gate_weights: torch.Tensor | None = None  # requires Python 3.10+
+        fused = (w.unsqueeze(-1) * L).sum(1)                 # [B, C]
+        return fused, gate_entropy_loss
 
     def forward(self, logits_list):
         # logits_list: length K, each [B,C]
@@ -221,5 +222,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         if K_eff == 1:
             return logits_list[0], entropy_loss
 
-        return self.fusion(logits_list), entropy_loss
+        fused_logits, gate_ent = self.fusion(logits_list)
+        total_ent = entropy_loss + gate_ent
+        return fused_logits, total_ent
 
