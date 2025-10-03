@@ -78,7 +78,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
     """
     def __init__(self, txt_input_dim=768, txt_out_size=300, knowledge_types=[2,3],
                  max_knowledge_length=20, cro_layers=6, cro_heads=5, cro_drop=0.5,
-                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1, use_attention_single=False):
+                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1, use_attention_single=True):
         super().__init__()
         self.txt_out_size = txt_out_size
         self.knowledge_types = knowledge_types
