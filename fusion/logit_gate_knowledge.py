@@ -123,9 +123,9 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         self.fusion = MultiLogitGateFusion(num_branches=len(knowledge_types), num_classes=2)
 
     def forward(self, texts, mask_batch, t1_word_seq, txt_edge_index, gnn_mask,
-                np_mask, knowledge_inputs, knowledge_masks):
+            np_mask, knowledge_inputs, knowledge_masks):
 
-        # Encode tokens
+        # Encode text + knowledge
         t_tok, t_scores_tok, k_type_emb, k_type_scores = self.knowledge_encoder(
             text_input=texts,
             knowledge_inputs=knowledge_inputs,
@@ -135,13 +135,30 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
 
         K = k_type_emb.size(1)
 
-        # 2) Fast path for single-knowledge ablations: no attention/gating distortion
         if K == 1:
-            fused_text_tok = t_tok
-            fused_k_type   = k_type_emb
-            entropy_loss   = torch.tensor(0.0, device=t_tok.device)
+            # Single-knowledge path
+            if self.use_attention_single:
+                # one-way cross-attention: text <- knowledge (no gating, no entropy)
+                attn = self.knowledge_fusion.attention
+                ln_t, proj_t = self.knowledge_fusion.ln_text, self.knowledge_fusion.out_proj_text
+
+                # k_type_emb is [B,1,D]; provide no mask (or [B,1] all False) to match shape
+                att_text, _ = attn(
+                    query=t_tok,
+                    key=k_type_emb,
+                    value=k_type_emb,
+                    key_padding_mask=None
+                )
+                fused_text_tok = ln_t(t_tok + proj_t(torch.nan_to_num(att_text)))
+            else:
+                # pure identity (no attention)
+                fused_text_tok = t_tok
+
+            fused_k_type = k_type_emb
+            entropy_loss = torch.tensor(0.0, device=t_tok.device)
+
         else:
-            # Multi-knowledge: use your learned attention/gating fusion
+            # Multi-knowledge: learned attention/gating
             fused_text_tok, fused_k_type, _, entropy_loss = self.knowledge_fusion(
                 text_embeddings=t_tok,
                 knowledge_embeddings=k_type_emb,
@@ -149,7 +166,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
                 knowledge_scores=k_type_scores
             )
 
-        # Tokens -> words for alignment
+        # --- Tokens -> words for alignment (this was missing) ---
         fused_text_word, fused_text_word_scores = pool_tokens_to_words_batch(
             seq=fused_text_tok,
             score=t_scores_tok,
@@ -157,29 +174,29 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
             pad_len=mask_batch.size(1)
         )
 
-        B, K, D = fused_k_type.shape
-        
-        # Dummy img_edge_index since this is knowledge-only
+        B, K_eff, D = fused_k_type.shape
+
+        # Knowledge-only => dummy image edge index
         dummy_img_ei = torch.zeros((B, 2, 0), dtype=torch.long, device=fused_k_type.device)
 
-        # Alignment produces [B, 2K] = concat over k of (a1_k, a2_k blocks)
+        # Alignment: [B, 2*K_eff]
         align = self.knowledge_alignment(
             t2=fused_text_word, v2=fused_k_type,
             edge_index=txt_edge_index, gnn_mask=gnn_mask,
             score=fused_text_word_scores, key_padding_mask=mask_batch, np_mask=np_mask,
             img_edge_index=dummy_img_ei, lam=self.lam
-        )  # [B, 2K]
+        )
 
-        # Split per-type, make per-type logits, fuse with gates
+        # Per-type tiny heads -> logits_k
         logits_list = []
-        for i in range(K):
-            a1_k = align[:, i]          # [B]
-            a2_k = align[:, i + K]      # [B]
+        for i in range(K_eff):
+            a1_k = align[:, i]
+            a2_k = align[:, i + K_eff]
             a_pair = torch.stack([a1_k, a2_k], dim=-1)  # [B,2]
             logits_k = self.type_heads[i](a_pair)       # [B,2]
             logits_list.append(logits_k)
 
-        if len(logits_list) == 1:
-            return logits_list[0], entropy_loss   # single-type ablation degenerates to its own logits
+        if K_eff == 1:
+            return logits_list[0], entropy_loss
 
-        return self.fusion(logits_list), entropy_loss  # gated sum across the selected knowledge types
+        return self.fusion(logits_list), entropy_loss
