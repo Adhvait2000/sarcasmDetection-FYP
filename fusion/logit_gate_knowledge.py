@@ -1,6 +1,7 @@
 # fusion/logit_gate_knowledge.py
 import torch
 import torch.nn as nn
+import math
 import torch.nn.functional as F
 
 from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAttention
@@ -10,7 +11,9 @@ class MultiLogitGateFusion(nn.Module):
     def __init__(self, num_branches, num_classes, tau=2.0, eps=0.0, entropy_lambda=5e-3):
         super().__init__()
         self.K = num_branches
-        self.C = num_classes
+        self.C = num_classes 
+        self.num_branches = num_branches
+        self.num_classes = num_classes
         self.tau = tau
         self.eps = eps
         self.entropy_lambda = entropy_lambda
