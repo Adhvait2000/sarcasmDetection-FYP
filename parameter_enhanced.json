@@ -16,6 +16,8 @@
     "weight_decay": 0.005,
     "lr": 2e-5,
     "head_lr": 1e-4,
+    "loss": "ce",
+    "label_smoothing": 0.1,
     
     "txt_input_dim": 768,
     "txt_out_size": 200,
