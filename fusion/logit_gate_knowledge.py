@@ -78,7 +78,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
     """
     def __init__(self, txt_input_dim=768, txt_out_size=300, knowledge_types=[2,3],
                  max_knowledge_length=20, cro_layers=6, cro_heads=5, cro_drop=0.5,
-                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1):
+                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1, use_attention_single=False):
         super().__init__()
         self.txt_out_size = txt_out_size
         self.knowledge_types = knowledge_types
@@ -89,6 +89,8 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         self.txt_gat_drop = txt_gat_drop
         self.txt_gat_head = txt_gat_head
         self.lam = lam
+
+        self.use_attention_single = use_attention_single
 
         # Text + knowledge encoders
         self.knowledge_encoder = EnhancedTextEncoder(
@@ -131,13 +133,21 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
             lam=self.lam
         )
 
-        # Cross attention to get (i) text contextualized by knowledge, (ii) per-type knowledge reprs
-        fused_text_tok, fused_k_type, _, entropy_loss = self.knowledge_fusion(  # ← CHANGED
-            text_embeddings=t_tok,
-            knowledge_embeddings=k_type_emb,
-            knowledge_masks=knowledge_masks,
-            knowledge_scores=k_type_scores
-        )
+        K = k_type_emb.size(1)
+
+        # 2) Fast path for single-knowledge ablations: no attention/gating distortion
+        if K == 1:
+            fused_text_tok = t_tok
+            fused_k_type   = k_type_emb
+            entropy_loss   = torch.tensor(0.0, device=t_tok.device)
+        else:
+            # Multi-knowledge: use your learned attention/gating fusion
+            fused_text_tok, fused_k_type, _, entropy_loss = self.knowledge_fusion(
+                text_embeddings=t_tok,
+                knowledge_embeddings=k_type_emb,
+                knowledge_masks=knowledge_masks,
+                knowledge_scores=k_type_scores
+            )
 
         # Tokens -> words for alignment
         fused_text_word, fused_text_word_scores = pool_tokens_to_words_batch(
@@ -148,6 +158,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         )
 
         B, K, D = fused_k_type.shape
+        
         # Dummy img_edge_index since this is knowledge-only
         dummy_img_ei = torch.zeros((B, 2, 0), dtype=torch.long, device=fused_k_type.device)
 

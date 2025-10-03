@@ -63,7 +63,6 @@ class KnowledgeExtractor:
 
         # Define problematic template-noun combinations to skip
         self.skip_combinations = {
-            # Cross-category combinations that don't make sense
             ("person", "food"), ("person", "building"), ("person", "vehicle"),
             ("food", "person"), ("food", "building"), ("food", "vehicle"), ("food", "animal"),
             ("building", "person"), ("building", "food"), ("building", "animal"),

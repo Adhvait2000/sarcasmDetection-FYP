@@ -377,10 +377,10 @@ class WeightedKnowledgeAttention(nn.Module):
                 logits = logits + ks
 
             # mask out inactive streams
-            neg_inf = torch.finfo(logits.dtype).min
-            logits = logits.masked_fill(kp_mask, neg_inf)
+            logits = logits.masked_fill(kp_mask, -float("inf"))
             all_inf = torch.isneginf(logits).all(dim=1, keepdim=True)
             logits = torch.where(all_inf, torch.zeros_like(logits), logits)
+
 
             # softmax with temperature
             w = F.softmax(logits / self.tau, dim=1)                               # [B, K]
