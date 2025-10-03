@@ -123,7 +123,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         self.fusion = MultiLogitGateFusion(num_branches=len(knowledge_types), num_classes=2)
 
     def forward(self, texts, mask_batch, t1_word_seq, txt_edge_index, gnn_mask,
-            np_mask, knowledge_inputs, knowledge_masks):
+                np_mask, knowledge_inputs, knowledge_masks):
 
         # Encode text + knowledge
         t_tok, t_scores_tok, k_type_emb, k_type_scores = self.knowledge_encoder(
@@ -136,29 +136,54 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         K = k_type_emb.size(1)
 
         if K == 1:
-            # Single-knowledge path
-            if self.use_attention_single:
-                # one-way cross-attention: text <- knowledge (no gating, no entropy)
-                attn = self.knowledge_fusion.attention
-                ln_t, proj_t = self.knowledge_fusion.ln_text, self.knowledge_fusion.out_proj_text
+            # Identify single knowledge stream (1=caption, 2=ANP, 3=ATTR)
+            ktype = int(self.knowledge_types[0]) if hasattr(self, "knowledge_types") else -1
 
-                # k_type_emb is [B,1,D]; provide no mask (or [B,1] all False) to match shape
-                att_text, _ = attn(
-                    query=t_tok,
-                    key=k_type_emb,
-                    value=k_type_emb,
-                    key_padding_mask=None
-                )
-                fused_text_tok = ln_t(t_tok + proj_t(torch.nan_to_num(att_text)))
-            else:
-                # pure identity (no attention)
+            if ktype == 1:
+                # ---- CAPTION-ONLY: keep identity (no attention) ----
                 fused_text_tok = t_tok
+                fused_k_type   = k_type_emb
+                entropy_loss   = torch.zeros((), device=t_tok.device)
 
-            fused_k_type = k_type_emb
-            entropy_loss = torch.tensor(0.0, device=t_tok.device)
+            else:
+                # ---- ANP/ATTR-ONLY: one-way cross-attention (text <- knowledge) ----
+                attn  = self.knowledge_fusion.attention
+                ln_t  = self.knowledge_fusion.ln_text
+                projt = self.knowledge_fusion.out_proj_text
+
+                B, Lk, Dk = k_type_emb.shape
+                if Lk > 1:
+                    # Rare: if tags came as a sequence, pool to [B,1,D]
+                    km = None
+                    if knowledge_masks and len(knowledge_masks) > 0 and knowledge_masks[0] is not None:
+                        km = knowledge_masks[0]
+                        if km.dim() == 3 and km.size(-1) == 1:
+                            km = km.squeeze(-1)                  # [B, Lk]
+                        km = km.bool()
+                        if km.size(1) != Lk:
+                            L = min(km.size(1), Lk)
+                            # pad with True (=ignore) up to Lk
+                            pad = torch.ones(B, Lk - L, dtype=torch.bool, device=km.device)
+                            km = torch.cat([km[:, :L], pad], dim=1)
+                        keep  = (~km).float().unsqueeze(-1)      # [B,Lk,1]
+                        denom = keep.sum(1, keepdim=True).clamp_min(1.0)
+                        k_type_emb = (k_type_emb * keep).sum(1, keepdim=True) / denom  # [B,1,D]
+                    else:
+                        k_type_emb = k_type_emb.mean(dim=1, keepdim=True)             # [B,1,D]
+
+                att_text, _ = attn(
+                    query=t_tok,           # [B, Lt, D]
+                    key=k_type_emb,        # [B, 1, D]
+                    value=k_type_emb,
+                    key_padding_mask=None  # single vector → no mask
+                )
+
+                fused_text_tok = ln_t(t_tok + projt(torch.nan_to_num(att_text)))
+                fused_k_type   = k_type_emb
+                entropy_loss   = torch.zeros((), device=t_tok.device)
 
         else:
-            # Multi-knowledge: learned attention/gating
+            # ---- MULTI-KNOWLEDGE: learned attention/gating ----
             fused_text_tok, fused_k_type, _, entropy_loss = self.knowledge_fusion(
                 text_embeddings=t_tok,
                 knowledge_embeddings=k_type_emb,
@@ -166,7 +191,7 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
                 knowledge_scores=k_type_scores
             )
 
-        # --- Tokens -> words for alignment (this was missing) ---
+        # --- Tokens -> words for alignment (unchanged) ---
         fused_text_word, fused_text_word_scores = pool_tokens_to_words_batch(
             seq=fused_text_tok,
             score=t_scores_tok,
@@ -175,17 +200,14 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         )
 
         B, K_eff, D = fused_k_type.shape
-
-        # Knowledge-only => dummy image edge index
         dummy_img_ei = torch.zeros((B, 2, 0), dtype=torch.long, device=fused_k_type.device)
 
-        # Alignment: [B, 2*K_eff]
         align = self.knowledge_alignment(
             t2=fused_text_word, v2=fused_k_type,
             edge_index=txt_edge_index, gnn_mask=gnn_mask,
             score=fused_text_word_scores, key_padding_mask=mask_batch, np_mask=np_mask,
             img_edge_index=dummy_img_ei, lam=self.lam
-        )
+        )  # [B, 2*K_eff]
 
         # Per-type tiny heads -> logits_k
         logits_list = []
@@ -200,3 +222,4 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
             return logits_list[0], entropy_loss
 
         return self.fusion(logits_list), entropy_loss
+
