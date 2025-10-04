@@ -76,14 +76,6 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
 
         self.use_attention_single = use_attention_single
 
-        # N-way gated fusion over type logits
-        self.fusion = MultiLogitGateFusion(
-            num_branches=len(knowledge_types),
-            num_classes=2,
-            tau=gate_tau,
-            entropy_lambda=gate_entropy_lambda
-        )
-
         # Text + knowledge encoders
         self.knowledge_encoder = EnhancedTextEncoder(
             input_size=txt_input_dim,
