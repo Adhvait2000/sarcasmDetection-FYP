@@ -20,6 +20,7 @@
     "label_smoothing": 0.1,
     "gate_tau": 2.0,
     "gate_entropy_lambda": 0.01,
+    "use_wka": false,
     
     "txt_input_dim": 768,
     "txt_out_size": 200,

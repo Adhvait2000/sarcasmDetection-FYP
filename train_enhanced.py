@@ -283,6 +283,7 @@ class EnhancedTrainer:
                 txt_gat_drop=self.parameter["txt_gat_drop"],
                 txt_gat_head=self.parameter["txt_gat_head"],
                 lam=self.parameter["lambda"],
+                use_wka=self.parameter.get("use_wka", False),
                 gate_tau=self.parameter.get("gate_tau", 2.0),
                  gate_entropy_lambda=self.parameter.get("gate_entropy_lambda", 0.01),
             )
