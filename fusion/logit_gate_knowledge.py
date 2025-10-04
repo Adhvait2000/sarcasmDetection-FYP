@@ -8,7 +8,7 @@ from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAt
 from model_enhanced import Alignment, pool_tokens_to_words_batch
 
 class MultiLogitGateFusion(nn.Module):
-    def __init__(self, num_branches, num_classes, tau=2.0, eps=0.0, entropy_lambda=0.0):
+    def __init__(self, num_branches, num_classes, tau=2.0, eps=0.0, entropy_lambda=0.01):
         super().__init__()
         self.K = num_branches
         self.C = num_classes 
@@ -21,6 +21,11 @@ class MultiLogitGateFusion(nn.Module):
         # simple, stable gate (no need to be fancy)
         self.norm = nn.LayerNorm(num_branches)
         self.gate = nn.Linear(num_branches, num_branches)
+
+         # ---- Uniform init: start near-equal weights across branches ----
+        with torch.no_grad():
+            self.gate.weight.zero_()
+            self.gate.bias.zero_()
 
     def forward(self, logits_list):
         # logits_list: list of [B, C] -> [B, K, C]
@@ -55,7 +60,9 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
     """
     def __init__(self, txt_input_dim=768, txt_out_size=300, knowledge_types=[2,3],
                  max_knowledge_length=20, cro_layers=6, cro_heads=5, cro_drop=0.5,
-                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1, use_attention_single=True):
+                 txt_gat_layer=2, txt_gat_drop=0.5, txt_gat_head=2, lam=1, use_attention_single=True,
+                  gate_tau=2.0, gate_entropy_lambda=0.01):
+        
         super().__init__()
         self.txt_out_size = txt_out_size
         self.knowledge_types = knowledge_types
@@ -68,6 +75,14 @@ class KnowledgeOnlyLogitGateModel(nn.Module):
         self.lam = lam
 
         self.use_attention_single = use_attention_single
+
+        # N-way gated fusion over type logits
+        self.fusion = MultiLogitGateFusion(
+            num_branches=len(knowledge_types),
+            num_classes=2,
+            tau=gate_tau,
+            entropy_lambda=gate_entropy_lambda
+        )
 
         # Text + knowledge encoders
         self.knowledge_encoder = EnhancedTextEncoder(

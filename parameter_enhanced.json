@@ -18,6 +18,8 @@
     "head_lr": 1e-4,
     "loss": "ce",
     "label_smoothing": 0.1,
+    "gate_tau": 2.0,
+    "gate_entropy_lambda": 0.01,
     
     "txt_input_dim": 768,
     "txt_out_size": 200,
@@ -27,10 +29,10 @@
     
     "cro_layers": 6,
     "cro_heads": 5,
-    "cro_drop": 0.5,
+    "cro_drop": 0.55,
     
     "txt_gat_layer": 2,
-    "txt_gat_drop": 0.5,
+    "txt_gat_drop": 0.55,
     "txt_gat_head": 2,
     "txt_self_loops": true,
     "img_gat_layer": 2,

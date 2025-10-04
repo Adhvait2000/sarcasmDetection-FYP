@@ -282,7 +282,9 @@ class EnhancedTrainer:
                 txt_gat_layer=self.parameter["txt_gat_layer"],
                 txt_gat_drop=self.parameter["txt_gat_drop"],
                 txt_gat_head=self.parameter["txt_gat_head"],
-                lam=self.parameter["lambda"]
+                lam=self.parameter["lambda"],
+                gate_tau=self.parameter.get("gate_tau", 2.0),
+                 gate_entropy_lambda=self.parameter.get("gate_entropy_lambda", 0.01),
             )
         elif self.model_type == "hybrid":
             return HybridModel(
@@ -537,7 +539,6 @@ class EnhancedTrainer:
 
             ce_loss = self.criterion(logits, labels)
             loss = ce_loss + entropy_loss
-
             self.optimizer.zero_grad()
             loss.backward()
 
@@ -817,7 +818,7 @@ class EnhancedTrainer:
         
         # Load best model for testing
         if best_ckpt_path:
-            checkpoint = torch.load(best_ckpt_path, map_location=device)
+            checkpoint = torch.load(best_ckpt_path, map_location=device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             print(f"\nLoaded best model from epoch {best_epoch+1}")
         else:
