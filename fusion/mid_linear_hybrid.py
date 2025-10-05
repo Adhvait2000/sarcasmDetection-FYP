@@ -4,7 +4,6 @@ import torch.nn as nn
 
 from images.image_models import ImageEncoder
 from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAttention
-from model_enhanced import HybridModel
 from interraction.inter_models import CroModality
 from model_enhanced import Alignment, pool_tokens_to_words_batch
 
@@ -12,9 +11,9 @@ from model_enhanced import Alignment, pool_tokens_to_words_batch
 class HybridMidLinearModel(nn.Module):
     """
     MID-LEVEL LINEAR FUSION:
-      - Branch A (Text↔Image): build an alignment representation BEFORE any logits
-      - Branch B (Text↔Knowledge): build an alignment/semantic representation BEFORE any logits
-      - MID fusion: concat([rep_A, rep_B]) -> shared classifier
+      - Branch A (Text↔Image): alignment map (pre-logits) -> proj
+      - Branch B (Text↔Knowledge): alignment scores + semantic pool (pre-logits) -> proj
+      - Fuse: concat([A_proj, B_proj]) -> classifier
     """
     def __init__(self, txt_input_dim=768, txt_out_size=300, img_input_dim=768,
                  img_inter_dim=500, img_out_dim=300, knowledge_types=(1, 2, 3),
@@ -118,6 +117,41 @@ class HybridMidLinearModel(nn.Module):
             nn.Linear(self.txt_out_size, 2)
         )
 
+    # --- small helper: normalize per-type masks to [B,K] where 1=valid, 0=absent ---
+    def _per_type_valid_mask(self, knowledge_masks, B, K, device):
+        """
+        Returns [B, K] float mask.
+        Accepts:
+          - None -> all valid
+          - list of per-type masks: each [B, Lk] or [B, Lk, 1], True=pad
+          - tensor [B, K] where True=pad/inactive (we invert)
+        """
+        if knowledge_masks is None:
+            return torch.ones(B, K, device=device)
+
+        if torch.is_tensor(knowledge_masks):
+            m = knowledge_masks.to(device)
+            if m.dim() == 2 and m.size(1) == K:
+                return (~m.bool()).float()  # invert: True-pad -> 0 valid
+            return torch.ones(B, K, device=device)
+
+        if isinstance(knowledge_masks, list):
+            cols = []
+            for i in range(K):
+                if i >= len(knowledge_masks) or knowledge_masks[i] is None:
+                    cols.append(torch.zeros(B, 1, device=device))  # treat missing as invalid
+                    continue
+                mb = knowledge_masks[i].to(device)
+                if mb.dim() == 3 and mb.size(-1) == 1:
+                    mb = mb.squeeze(-1)
+                # mb: True=pad; if ALL pad -> invalid, else valid
+                all_pad = mb.bool().all(dim=1, keepdim=True)
+                valid = (~all_pad).float()
+                cols.append(valid)
+            return torch.cat(cols, dim=1)
+
+        return torch.ones(B, K, device=device)
+
     def forward(self, imgs, texts, mask_batch, img_edge_index,
                 t1_word_seq, txt_edge_index, gnn_mask, np_mask,
                 knowledge_inputs, knowledge_masks):
@@ -193,25 +227,27 @@ class HybridMidLinearModel(nn.Module):
         if has_knowledge:
             K = twoK // 2
             # pooled alignment scores per class: [B,2]
-            kn_pooled = torch.cat([
-                know_align[:, :K].mean(1, keepdim=True),
-                know_align[:, K:].mean(1, keepdim=True)
-            ], dim=1)
+            a1 = know_align[:, :K]   # [B,K]
+            a2 = know_align[:, K:]   # [B,K]
 
-            # mask-aware mean over knowledge tokens -> [B, txt_out_size]
-            if knowledge_masks is not None:
-                valid = (~knowledge_masks.bool()).float()                 # [B, K]
-                denom = valid.sum(dim=1, keepdim=True).clamp_min(1)
-                kn_semantic = (fused_k_type * valid.unsqueeze(-1)).sum(dim=1) / denom
-            else:
-                kn_semantic = fused_k_type.mean(dim=1)
+            # per-type validity mask [B,K]
+            valid = self._per_type_valid_mask(knowledge_masks, B=B_, K=K, device=device)
+            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
 
-            kn_emb = torch.cat([kn_pooled, kn_semantic], dim=-1)          # [B, txt_out_size+2]
-            kn_repr = self.proj_kn(kn_emb)                                 # [B, txt_out_size]
+            a1_mean = (a1 * valid).sum(dim=1, keepdim=True) / denom
+            a2_mean = (a2 * valid).sum(dim=1, keepdim=True) / denom
+            kn_pooled = torch.cat([a1_mean, a2_mean], dim=1)  # [B,2]
+
+            # semantic pooling over available types -> [B, D]
+            kn_semantic = (fused_k_type * valid.unsqueeze(-1)).sum(dim=1) / denom
+
+            # concat scores+semantic -> project
+            kn_emb = torch.cat([kn_pooled, kn_semantic], dim=-1)  # [B, 2 + D]
+            kn_repr = self.proj_kn(kn_emb)                        # [B, D]
         else:
             kn_repr = torch.zeros(B_, self.txt_out_size, device=device, dtype=ti_repr.dtype)
 
         # ----- MID FUSION & CLASSIFY -----
-        h = torch.cat([ti_repr, kn_repr], dim=-1)                          # [B, 2*txt_out_size]
-        logits = self.classifier(h)                                         # [B, 2]
+        h = torch.cat([ti_repr, kn_repr], dim=-1)                 # [B, 2*D]
+        logits = self.classifier(h)                                # [B, 2]
         return logits
