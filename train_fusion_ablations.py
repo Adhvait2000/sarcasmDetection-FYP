@@ -3,9 +3,9 @@ import argparse
 import os
 import json
 from train_enhanced import EnhancedTrainer
-from fusion.late_sum_hybrid import HybridLateSumModel
+from fusion.mid_linear_hybrid import HybridMidLinearModel
 from fusion.logit_gate_hybrid import HybridLogitGateModel
-from fusion.attn_weighted_hybrid import HybridAttnWeightedModel
+from fusion.early_fusion_hybrid import FiLMEarlyFusion
 from utils.logging.tf_logger import SimpleLogger as Logger
 
 class FusionAblationTrainer(EnhancedTrainer):
@@ -47,12 +47,12 @@ class FusionAblationTrainer(EnhancedTrainer):
             type_bmco=p["type_bmco"],
         )
 
-        if self._fusion_variant == "late_sum":
-            return HybridLateSumModel(**common_kwargs)
+        if self._fusion_variant == "mid_linear":
+            return HybridMidLinearModel(**common_kwargs)
         elif self._fusion_variant == "logit_gate":
             return HybridLogitGateModel(**common_kwargs)
-        elif self._fusion_variant == "attn_weighted":
-            return HybridAttnWeightedModel(**common_kwargs)   
+        elif self._fusion_variant == "early_film":
+            return FiLMEarlyFusion(**common_kwargs)   
         else:
             raise ValueError(f"Unknown fusion variant: {self._fusion_variant}")
         
