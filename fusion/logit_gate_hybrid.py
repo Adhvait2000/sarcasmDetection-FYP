@@ -168,6 +168,22 @@ class HybridLogitGateModel(nn.Module):
             img_edge_index=img_edge_index, lam=self.lam
         )
 
+        kb_out = self.knowledge_branch(
+            texts=texts, mask_batch=mask_batch,
+            t1_word_seq=t1_word_seq, txt_edge_index=txt_edge_index,
+            gnn_mask=gnn_mask, np_mask=np_mask,
+            knowledge_inputs=knowledge_inputs, knowledge_masks=knowledge_masks
+        )
+
+        # Accept both shapes for backward-compat
+        if isinstance(kb_out, tuple):
+            logits_k, extra = kb_out
+            # optionally bubble aux loss up to the trainer
+            if isinstance(extra, torch.Tensor):
+                self._extra_loss = getattr(self, "_extra_loss", 0.0) + extra
+        else:
+            logits_k = kb_out
+
         # (Optional) use pv as a soft attention prior; keep your original trick
         pv_scaled = torch.softmax(pv, dim=1).repeat(1, 2)  # [B, 2*Kimg]
         logits_ti = self.text_image_output(ti_align * pv_scaled)  # [B, 2]

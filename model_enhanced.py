@@ -3,6 +3,7 @@ Enhanced Model Variants
 Implements the three configurations: Baseline, Knowledge-only, and Hybrid
 """
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from images.image_models import ImageEncoder
@@ -482,12 +483,11 @@ class HybridModel(nn.Module):
         )
 
         # Knowledge fusion (still token-level inputs)
-        fused_text, fused_knowledge, attention_weights = self.knowledge_fusion(
+        fused_text, fused_knowledge, attention_weights, entropy_loss = self.knowledge_fusion(
             text_embeddings=texts,
             knowledge_embeddings=knowledge_embeddings,
             knowledge_masks=knowledge_masks,
             knowledge_scores=knowledge_scores
-
         )
 
         # ▶︎ Pool fused_text to words for knowledge alignment

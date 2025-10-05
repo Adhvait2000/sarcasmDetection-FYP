@@ -149,7 +149,7 @@ class HybridMidLinearModel(nn.Module):
         )
 
         # ----- Knowledge cross-attn -----
-        fused_text_tok, fused_k_type, _ = self.knowledge_fusion(
+        fused_text_tok, fused_k_type, _w, _ent = self.knowledge_fusion(
             text_embeddings=t_tok,
             knowledge_embeddings=k_type_emb,
             knowledge_masks=knowledge_masks,
