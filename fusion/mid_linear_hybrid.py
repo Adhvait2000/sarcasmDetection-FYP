@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from images.image_models import ImageEncoder
 from text.multi_knowledge_models import EnhancedTextEncoder, WeightedKnowledgeAttention
+from model_enhanced import HybridModel
 from interraction.inter_models import CroModality
 from model_enhanced import Alignment, pool_tokens_to_words_batch
 

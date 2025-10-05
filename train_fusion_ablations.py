@@ -1,26 +1,34 @@
-# train_late_sum.py  (now supports both late_sum & logit_gate)
+# train_fusion.py
 import argparse
 import os
 import json
+import torch
+
 from train_enhanced import EnhancedTrainer
-from fusion.mid_linear_hybrid import HybridMidLinearModel
-from fusion.logit_gate_hybrid import HybridLogitGateModel
-from fusion.early_fusion_hybrid import FiLMEarlyFusion
 from utils.logging.tf_logger import SimpleLogger as Logger
 
+# --- Fusion model imports ---
+# Baseline late-linear (your original HybridModel)
+from fusion.hybrid_model import HybridModel                     # late_linear
+# Late-gate
+from fusion.logit_gate_hybrid import HybridLogitGateModel       # logit_gate
+# Mid-linear (representation-level)
+from fusion.mid_linear_hybrid import HybridMidLinearModel       # mid_linear
+# Early FiLM
+from fusion.early_fusion_hybrid import FiLMEarlyFusion          # early_film
+
+
 class FusionAblationTrainer(EnhancedTrainer):
-    def __init__(self, model_type="hybrid", parameter_file="parameter.json", fusion="late_sum"):
+    def __init__(self, model_type="hybrid", parameter_file="parameter.json", fusion="late_linear"):
         self._fusion_variant = fusion
         super().__init__(model_type=model_type, parameter_file=parameter_file)
-
         self.logger = Logger(f"logs/{model_type}_{fusion}_training")
 
     def _fusion_suffix(self):
         return f"_{self._fusion_variant}" if getattr(self, "_fusion_variant", None) else ""
 
-
     def _initialize_model(self):
-        # For non-hybrid, use your original mapping
+        # Fall back to the parent for non-hybrid models
         if self.model_type != "hybrid":
             return super()._initialize_model()
 
@@ -47,66 +55,81 @@ class FusionAblationTrainer(EnhancedTrainer):
             type_bmco=p["type_bmco"],
         )
 
-        if self._fusion_variant == "mid_linear":
-            return HybridMidLinearModel(**common_kwargs)
-        elif self._fusion_variant == "logit_gate":
+        fv = self._fusion_variant
+        if fv == "late_linear":
+            # Baseline: linear on concatenated logits
+            return HybridModel(**common_kwargs)
+        elif fv == "logit_gate":
+            # Per-class adaptive gating on logits
             return HybridLogitGateModel(**common_kwargs)
-        elif self._fusion_variant == "early_film":
-            return FiLMEarlyFusion(**common_kwargs)   
+        elif fv == "mid_linear":
+            # Representation-level concat -> one classifier
+            return HybridMidLinearModel(**common_kwargs)
+        elif fv == "early_film":
+            # Knowledge-conditioned FiLM on image features (early)
+            return FiLMEarlyFusion(**common_kwargs)
         else:
-            raise ValueError(f"Unknown fusion variant: {self._fusion_variant}")
-        
+            raise ValueError(f"Unknown fusion variant: {fv}")
+
     # --- override filenames for checkpoints ---
     def save_model(self, epoch, metrics, save_dir="saved_models"):
         os.makedirs(save_dir, exist_ok=True)
         checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'metrics': metrics,
-            'model_type': self.model_type,
-            'parameter': self.parameter
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "metrics": metrics,
+            "model_type": self.model_type,
+            "parameter": self.parameter,
+            "fusion": self._fusion_variant,
         }
         path = f"{save_dir}/{self.model_type}{self._fusion_suffix()}_epoch_{epoch}.pt"
-        import torch
         torch.save(checkpoint, path)
         return path
-    
-     # --- ensure confusion matrix filename includes fusion ---
+
+    # --- ensure confusion-matrix filename includes fusion ---
     def plot_confusion_matrix(self, cm, save_path):
-        # inject fusion suffix into whatever path parent passes
         root, ext = os.path.splitext(save_path)
         fused_path = f"{root}{self._fusion_suffix()}{ext}"
         return super().plot_confusion_matrix(cm, fused_path)
-    
+
     # --- after training, also emit a fusion-suffixed results file ---
     def train(self, num_epochs):
         results = super().train(num_epochs)
 
         # Write an extra results file with fusion suffix to avoid collisions
         results_file = f"results_{self.model_type}{self._fusion_suffix()}.json"
-        with open(results_file, 'w') as f:
+        with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
         print(f"[Info] Also saved fusion-specific results to: {results_file}")
 
         return results
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_type', type=str, default='hybrid', choices=['hybrid'])
-    parser.add_argument('--fusion', type=str, default='late_sum',
-                        choices=['late_sum', 'logit_gate', 'attn_weighted']) 
-    parser.add_argument('--parameter_file', type=str, default='parameter.json')
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument("--model_type", type=str, default="hybrid", choices=["hybrid"])
+    parser.add_argument(
+        "--fusion",
+        type=str,
+        default="late_linear",
+        choices=["late_linear", "logit_gate", "mid_linear", "early_film"],
+        help="Fusion variant to train"
+    )
+    parser.add_argument("--parameter_file", type=str, default="parameter.json")
+    parser.add_argument("--epochs", type=int, default=10)
     args = parser.parse_args()
 
     trainer = FusionAblationTrainer(args.model_type, args.parameter_file, fusion=args.fusion)
     results = trainer.train(args.epochs)
 
     print(f"\n[{args.fusion}] Completed for {args.model_type}")
-    print(f"Best Val F1: {results['best_val_f1']:.4f}")
-    print(f"Test F1: {results['test_metrics']['f1']:.4f}")
+    if "best_val_f1" in results:
+        print(f"Best Val F1: {results['best_val_f1']:.4f}")
+    if "test_metrics" in results and "f1" in results["test_metrics"]:
+        print(f"Test F1: {results['test_metrics']['f1']:.4f}")
+
 
 if __name__ == "__main__":
     main()
