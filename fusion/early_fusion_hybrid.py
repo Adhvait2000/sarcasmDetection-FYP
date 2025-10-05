@@ -11,13 +11,12 @@ class FiLMLayer(nn.Module):
     """
     Residual Feature-wise Linear Modulation:
       y = (1 + gamma) * x + beta
-    gamma, beta are predicted from a conditioning vector.
     """
     def __init__(self, feature_dim: int, condition_dim: int):
         super().__init__()
         self.gamma_net = nn.Linear(condition_dim, feature_dim)
         self.beta_net  = nn.Linear(condition_dim, feature_dim)
-        # Zero-init so FiLM starts as identity: y ≈ x
+        # Start as identity
         nn.init.zeros_(self.gamma_net.weight); nn.init.zeros_(self.gamma_net.bias)
         nn.init.zeros_(self.beta_net.weight);  nn.init.zeros_(self.beta_net.bias)
 
@@ -30,14 +29,7 @@ class FiLMLayer(nn.Module):
 
 class FiLMEarlyFusion(nn.Module):
     """
-    EARLY FUSION via FiLM (knowledge → image modulation BEFORE any cross-modal interaction)
-
-    Pipeline:
-      1) Encode text (+ knowledge) to get token reps and per-type knowledge embeddings
-      2) Pool knowledge embeddings -> conditioning vector
-      3) Encode image patches, then apply FiLM(condition) to image features  (EARLY)
-      4) Cross-modal interaction (text ↔ modulated images)
-      5) Alignment + classification  (single head; no per-branch logits)
+    EARLY FUSION via FiLM (knowledge → image modulation BEFORE cross-modal interaction).
     """
     def __init__(self, txt_input_dim=768, txt_out_size=300, img_input_dim=768,
                  img_inter_dim=500, img_out_dim=300, knowledge_types=(1, 2, 3),
@@ -119,6 +111,29 @@ class FiLMEarlyFusion(nn.Module):
             nn.Linear(2 * self.img_patch, 2)
         )
 
+    @staticmethod
+    def _pool_knowledge_to_vec(k_type_emb: torch.Tensor) -> torch.Tensor | None:
+        """
+        Robustly pool per-type knowledge embeddings to [B, D]:
+          - [B, K, L, D] -> mean over L then K
+          - [B, K, D]    -> mean over K
+          - [B, D]       -> as-is
+          - None         -> None
+        """
+        if k_type_emb is None:
+            return None
+        if k_type_emb.dim() == 4:
+            # [B, K, L, D] -> [B, K, D] -> [B, D]
+            return k_type_emb.mean(dim=2).mean(dim=1)
+        if k_type_emb.dim() == 3:
+            # [B, K, D] -> [B, D]
+            return k_type_emb.mean(dim=1)
+        if k_type_emb.dim() == 2:
+            # [B, D]
+            return k_type_emb
+        # Unexpected shape: be conservative
+        return None
+
     def forward(self, imgs, texts, mask_batch, img_edge_index,
                 t1_word_seq, txt_edge_index, gnn_mask, np_mask,
                 knowledge_inputs, knowledge_masks):
@@ -132,10 +147,9 @@ class FiLMEarlyFusion(nn.Module):
         )
 
         # Build conditioning vector from knowledge embeddings
-        # Expected k_type_emb shape ~ [B, K, L, D]. We average over (K,L) → [B, D].
-        if (k_type_emb is not None) and (k_type_emb.ndim >= 3) and (k_type_emb.size(1) > 0):
-            k_pooled = k_type_emb.mean(dim=(1, 2))  # [B, D]
-            condition = self.knowledge_pooler(k_pooled)  # [B, 256]
+        k_vec = self._pool_knowledge_to_vec(k_type_emb)  # [B, D] or None
+        if k_vec is not None:
+            condition = self.knowledge_pooler(k_vec)  # [B, 256]
         else:
             condition = torch.zeros(imgs.size(0), 256, device=imgs.device, dtype=imgs.dtype)
 
