@@ -9,7 +9,7 @@ from utils.logging.tf_logger import SimpleLogger as Logger
 
 # --- Fusion model imports ---
 # Baseline late-linear (your original HybridModel)
-from fusion.hybrid_model import HybridModel                     # late_linear
+from model_enhanced import HybridModel                     # late_linear
 # Late-gate
 from fusion.logit_gate_hybrid import HybridLogitGateModel       # logit_gate
 # Mid-linear (representation-level)
