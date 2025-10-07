@@ -353,7 +353,7 @@ class EnhancedTrainer:
         test_img_file = self.parameter.get("test_img_file", "test_B32.pt")
 
         cache_dir = self.parameter.get("cache_dir")
-        anp_cache = os.path.join(cache_dir, "anp_attr_all.jsonl")
+        anp_cache = os.path.join(cache_dir, "anp_attr_all_t027.jsonl")
         cap_cache = os.path.join(cache_dir, "captions_all.jsonl")
 
         def _assert_file(p, label):
