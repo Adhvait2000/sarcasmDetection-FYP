@@ -144,11 +144,17 @@ def main():
                 continue
 
         imgs, img_ids = [], []
+        seen_ids = set() 
         for p in batch_paths:
+            base_id = p.stem.split()[0]  # get part before any space
+            if base_id in seen_ids:
+                continue  # skip duplicates like "12345 2"
+            seen_ids.add(base_id)
+
             try:
                 im = load_image_rgb(p)
                 imgs.append(im)
-                img_ids.append(p.stem)
+                img_ids.append(base_id)
             except Exception:
                 fail += 1
 
