@@ -35,7 +35,7 @@ def deduplicate_captions(input_file: str, output_file: str):
 
 if __name__ == "__main__":
     # Simple usage
-    input_file = "caches/anp_attr_all.jsonl"  # Your original file
-    output_file = "caches/anp_attr_all_clean.jsonl"  # Clean output
+    input_file = "caches/anp_attr_all_t029.jsonl"  # Your original file
+    output_file = "caches/anp_attr_all_t029_clean.jsonl"  # Clean output
     
     deduplicate_captions(input_file, output_file)
